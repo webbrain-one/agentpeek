@@ -1,16 +1,31 @@
 // Entry for index.html — first-paint modules only.
-// Heavy viewer libs (marked/hljs/diff/diff2html + components/render/ws) are loaded
+// Viewer libs and modules are loaded
 // lazily by globals.js -> loadViewerLibs(), triggered after the inline shell renders
-// the device list (or when the user opens a session, whichever comes first).
-
-import '../css/style.css';
+// the device list. Diff rendering stays deferred until an Edit is expanded.
 
 import './state.js';
 import './api.js';
 import './components/skeleton.js';
+import '../css/back-button.css';
+import '../css/breadcrumb.css';
+import '../css/file-icons.css';
+import '../css/loading.css';
+import '../css/project-files.css';
+import '../css/git-status.css';
+import '../css/workspace-header.css';
+import '../css/copy.css';
 import './globals.js';   // defines window.loadViewerLibs (does NOT download libs yet)
 import './app.js';
+import './preview-prewarm.js';
+import './project/browser.js';
 import './scroll-indicator.js';
+import { initMacosZoom } from './macos-zoom.js';
+import { initMacosTabs } from './macos-tabs.js';
+import { initSystemBack } from './system-back.js';
+
+initMacosZoom();
+initMacosTabs();
+initSystemBack();
 
 // Replay any clicks queued by the inline shell before app.js was ready.
 if (Array.isArray(window.__navQueue)) {

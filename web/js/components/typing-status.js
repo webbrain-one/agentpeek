@@ -20,6 +20,9 @@ import { state } from '../state.js';
 
   var _glyphIv = null, _typingIv = null, _pauseTimer = null;
   var _currentVerb = '';
+  var _currentRuntime = '';
+  var _outputShownAt = 0, _hideTimer = null, _wasRunning = false, _turnEnded = false;
+  var MIN_OUTPUT_VISIBLE_MS = 500;
 
   function pick() {
     var v;
@@ -33,9 +36,10 @@ import { state } from '../state.js';
   }
 
   function startTyping(verbEl) {
-    var newVerb = pick();
+    var fixed = _currentRuntime === 'codex';
+    var newVerb = fixed ? 'Working' : pick();
     var newText = newVerb + '...';
-    var oldText = _currentVerb ? _currentVerb + '...' : '';
+    var oldText = !fixed && _currentVerb ? _currentVerb + '...' : '';
     _currentVerb = newVerb;
     var len = newText.length, pos = 0;
     var frameMs = TYPING_MS / len;
@@ -52,16 +56,69 @@ import { state } from '../state.js';
     }, frameMs);
   }
 
+  window.markSpinnerTurnEnd = function () {
+    _turnEnded = true;
+  };
+
   window.updateSpinner = function () {
     var el = document.getElementById('cc-spinner');
-    // Hide the spinner while a permission prompt is up — the user is answering, not waiting.
-    var promptUp = typeof hasActivePermissionPrompt === 'function' && hasActivePermissionPrompt();
-    var shouldShow = state.wsRunning && !promptUp;
-
-    if (!shouldShow) {
-      if (el) el.style.display = 'none';
+    if (!state.appState.session) {
+      clearTimeout(_hideTimer);
+      _hideTimer = null;
+      _outputShownAt = 0;
+      _wasRunning = false;
+      _turnEnded = false;
+      if (el) el.remove();
       stopTimers();
       _currentVerb = '';
+      _currentRuntime = '';
+      return;
+    }
+    // Hide the spinner while a permission prompt is up — the user is answering, not waiting.
+    var promptUp = typeof hasActivePermissionPrompt === 'function' && hasActivePermissionPrompt();
+    // Hold the spinner until the skeleton clears — else it shows under the loading placeholder.
+    var skeleton = !!document.querySelector('#content .skeleton-messages');
+    var shouldShow = state.wsRunning && !promptUp && !skeleton;
+    var runtime = state.appState.runtime === 'codex' ? 'codex' : 'claude';
+
+    if (state.wsRunning && !_wasRunning) {
+      clearTimeout(_hideTimer);
+      _hideTimer = null;
+      _outputShownAt = 0;
+      _turnEnded = false;
+    }
+    if (state.wsRunning && !_outputShownAt
+      && document.querySelector('.assistant-turn.stream-preview [data-block-id]')) {
+      _outputShownAt = Date.now();
+    }
+    _wasRunning = state.wsRunning;
+
+    if (!shouldShow) {
+      var remaining = !state.wsRunning && _turnEnded && _outputShownAt
+        ? MIN_OUTPUT_VISIBLE_MS - (Date.now() - _outputShownAt)
+        : 0;
+      if (el && remaining > 0) {
+        if (!_hideTimer) {
+          _hideTimer = setTimeout(function () {
+            _hideTimer = null;
+            window.updateSpinner();
+          }, remaining);
+        }
+        return;
+      }
+      clearTimeout(_hideTimer);
+      _hideTimer = null;
+      _turnEnded = false;
+      if (el) {
+        // Collapse the status row instead of removing it from layout in one
+        // frame. This avoids a bottom-scroll jump without leaving an idle gap.
+        el.style.display = 'flex';
+        el.classList.add('is-collapsed');
+        el.setAttribute('aria-hidden', 'true');
+      }
+      stopTimers();
+      _currentVerb = '';
+      _currentRuntime = '';
       return;
     }
 
@@ -78,10 +135,19 @@ import { state } from '../state.js';
       content.appendChild(el);
     }
     el.style.display = 'flex';
+    el.classList.remove('is-collapsed');
+    el.removeAttribute('aria-hidden');
+
+    if (_currentRuntime !== runtime) {
+      stopTimers();
+      _currentVerb = '';
+      _currentRuntime = runtime;
+    }
 
     if (!_glyphIv) {
       var frame = 0;
-      el.innerHTML = '<span class="cc-spinner-glyph">' + FRAMES[0] + '</span><span class="cc-spinner-verb"></span>';
+      el.innerHTML = '<div class="cc-spinner-inner"><span class="cc-spinner-glyph">'
+        + FRAMES[0] + '</span><span class="cc-spinner-verb"></span></div>';
       var glyphEl = el.querySelector('.cc-spinner-glyph');
       var verbEl = el.querySelector('.cc-spinner-verb');
 

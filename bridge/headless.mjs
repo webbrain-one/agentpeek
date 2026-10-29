@@ -10,20 +10,19 @@
 
 import { spawn, execFileSync } from 'child_process';
 import readline from 'readline';
-import { resolveClaudeBin } from './session.mjs';
+import { randomUUID } from 'node:crypto';
+import { requireClaudeBin, resolveClaudeBin } from './session.mjs';
+import { StreamFramer } from './stream-framer.mjs';
+import { userMessageUuidForTurnId } from './live-turn-stream.mjs';
 
 export const HEADLESS_IDLE_TTL_MS = 10 * 60_000; // reap a session idle this long
 export const HEADLESS_MAX_PROCS = 16;            // LRU-evict beyond this
 export const HEADLESS_INIT_TIMEOUT_MS = 30_000;  // wait for system/init before first send
 export const HEADLESS_REAP_INTERVAL_MS = 60_000;
-const RESULT_GRACE_MS = 2000;
-// Coalesce a block's bursty deltas over this window into ONE frame (~4.5x fewer WS frames); boundary events flush it first.
-const DELTA_BATCH_MS = 50;
-
 // One live claude process bound to a sessionId.
 // State machine: spawning → ready (idle|busy) → dead.
 class HeadlessProc {
-  constructor(pool, key, cwd, resumeId, createId) {
+  constructor(pool, key, cwd, resumeId, createId, options = {}) {
     this.pool = pool;
     this.key = key;             // pool map key (sessionId, or a temp id for new sessions)
     this.cwd = cwd;
@@ -36,33 +35,42 @@ class HeadlessProc {
     this.ready = false;         // system/init seen
     this.busy = false;          // a turn is generating
     this.dead = false;
-    this.queue = [];            // messages waiting for idle
+    this.inputs = new Map();
+    this._heldReplies = [];     // synthetic replies waiting for their prompt replay
     this.lastActiveAt = 0;      // set via Date-free ticker (pool.now)
     this.streamId = null;       // current turn's preview id
     this._initWaiters = [];     // resolve on system/init
     this._cb = null;
-    this._seq = 0;              // turn-level monotonic frame counter (app's reorder key)
     this._blockId = -1;
-    this._graceUntil = 0;
-    this._batch = null;         // pending coalesced delta { blockId, kind, text }
-    this._batchTimer = null;    // flush timer for _batch
+    this._framer = new StreamFramer((frame) => this._emitFrame(frame));
+    this._pendingCtl = new Map(); // outbound control_request id → {resolve,reject,timer}
+    this.noPersistence = !!options.noPersistence;
+    this.bare = !!options.bare;
   }
 
   spawn() {
-    const bin = resolveClaudeBin() || 'claude';
+    const bin = this.pool.bin || requireClaudeBin();
     const args = [
       '-p',
       '--input-format', 'stream-json',
       '--output-format', 'stream-json',
       '--include-partial-messages',
+      '--replay-user-messages',
       '--verbose',
       '--permission-prompt-tool', 'stdio',
     ];
+    if (this.noPersistence) args.push('--no-session-persistence');
+    if (this.bare) args.push('--bare');
     // --session-id (new) and --resume (existing) are mutually exclusive — both makes CC swallow stdin; createId wins.
     if (this.createId) args.push('--session-id', this.createId);
     else if (this.sessionId) args.push('--resume', this.sessionId);
-    this.proc = spawn(bin, args, { cwd: this.cwd, stdio: ['pipe', 'pipe', 'pipe'] });
+    this.proc = spawn(bin, args, {
+      cwd: this.cwd,
+      env: this.pool.env ? { ...process.env, ...this.pool.env } : undefined,
+      stdio: ['pipe', 'pipe', 'pipe'],
+    });
     this.stdin = this.proc.stdin;
+    this.stdin.on('error', (error) => this._onClose(-1, error.message));
 
     const rl = readline.createInterface({ input: this.proc.stdout });
     rl.on('line', (line) => this._onLine(line));
@@ -97,24 +105,58 @@ class HeadlessProc {
       const ev = o.event || {};
       const d = ev.delta || {};
       if (ev.type === 'content_block_delta' && (d.type === 'text_delta' || d.type === 'thinking_delta')) {
-        this._accumulate('delta', this._blockId, (d.text ?? d.thinking) || '');
+        this._framer.delta(this._blockId, (d.text ?? d.thinking) || '');
       } else if (ev.type === 'content_block_delta' && d.type === 'input_json_delta') {
-        this._accumulate('input', this._blockId, d.partial_json || '');
+        this._framer.input(this._blockId, d.partial_json || '');
       } else if (ev.type === 'content_block_start') {
-        this._flushBatch();
         this._blockId++;
         const cb = ev.content_block || {};
-        this._cb?.onBlockStart?.(this.streamId, this._blockId, cb.type || 'text', cb.name || null, this._seq++);
+        this._framer.start(this._blockId, cb.type || 'text', cb.name || null);
       } else if (ev.type === 'content_block_stop') {
-        this._flushBatch();
-        this._cb?.onBlockStop?.(this.streamId, this._blockId, this._seq++);
+        this._framer.stop(this._blockId);
       }
       return;
     }
 
     // Full authoritative rows (same uuid as jsonl → app dedupes; renders in/out cards).
     if ((t === 'assistant' || t === 'user') && o.uuid) {
+      if (t === 'user' && !o.timestamp && this.inputs.has(o.uuid)) {
+        this._cb?.onInputConsumed?.([this.inputs.get(o.uuid).streamId]);
+        return;
+      }
+      // isSynthetic = JSONL isMeta (model-only, e.g. Read image scale note); history drops it too.
+      if (t === 'user' && o.isSynthetic) return;
+      // Forked skill's subagent rows; the watcher delivers them to the child thread.
+      if (String(o.parent_tool_use_id || '').startsWith('forked-command-')) return;
+      // Commands emit their synthetic reply before the prompt replay; keep the prompt first.
+      const unconsumed = [...this.inputs.values()].filter((input) => !input.consumed);
+      if (t === 'assistant' && o.message?.model === '<synthetic>'
+        && unconsumed.length && unconsumed.every((input) => !input.replayed)) {
+        this._heldReplies.push(o);
+        return;
+      }
       this._cb?.onMessage?.(this.streamId, o);
+      if (t === 'user' && this.inputs.has(o.uuid)) {
+        this.inputs.get(o.uuid).replayed = true;
+        this._flushHeldReplies();
+      }
+      return;
+    }
+
+    // CC's reply to our outbound control_request (interrupt) — resolve the waiter.
+    if (t === 'control_response') {
+      const rid = o.response?.request_id;
+      const w = rid && this._pendingCtl.get(rid);
+      if (w) {
+        this._pendingCtl.delete(rid);
+        clearTimeout(w.timer);
+        if (o.response?.subtype === 'success') w.resolve(o.response.response);
+        else w.reject(new Error(
+          o.response?.error
+          || o.response?.response?.error
+          || 'Claude Code control request failed.',
+        ));
+      }
       return;
     }
 
@@ -126,59 +168,69 @@ class HeadlessProc {
 
     // Turn finished
     if (t === 'result') {
-      this._flushBatch();
-      this.busy = false;
-      this._graceUntil = Date.now() + RESULT_GRACE_MS;
+      this._framer.finish();
+      this._flushHeldReplies();
+      const consumed = Array.isArray(o.user_message_uuids)
+        ? o.user_message_uuids
+        : [...this.inputs.keys()].filter((uuid) => !this.inputs.get(uuid).consumed).slice(0, 1);
+      const consumedInputIds = [];
+      for (const uuid of consumed) {
+        const input = this.inputs.get(uuid);
+        if (!input) continue;
+        input.consumed = true;
+        consumedInputIds.push(input.streamId);
+      }
+      this.busy = [...this.inputs.values()].some((input) => !input.consumed);
       this.pool._touch(this);
       const cb = this._cb;
-      this._cb = null;
       const sid = this.streamId;
-      this.streamId = null;
-      cb?.onResult?.(sid, o, this._seq); // finalSeq = total frames sent this turn
-      this._drainQueue();
+      if (!this.busy) {
+        this._cb = null;
+        this.streamId = null;
+      }
+      cb?.onResult?.(sid, { ...o, consumedInputIds, continued: this.busy });
       return;
     }
 
   }
 
-  // Leading edge: a block's first chunk flushes immediately (low first-token latency); the armed timer's cooldown coalesces the rest over DELTA_BATCH_MS.
-  _accumulate(t, blockId, chunk) {
-    if (this._batch && (this._batch.t !== t || this._batch.blockId !== blockId)) this._flushBatch();
-    if (!this._batch && !this._batchTimer) {
-      this._batch = { t, blockId, text: chunk };
-      this._flushBatch();
-      this._batchTimer = setTimeout(() => { this._batchTimer = null; this._flushBatch(); }, DELTA_BATCH_MS);
-      return;
-    }
-    if (!this._batch) this._batch = { t, blockId, text: '' };
-    this._batch.text += chunk;
-    if (!this._batchTimer) this._batchTimer = setTimeout(() => { this._batchTimer = null; this._flushBatch(); }, DELTA_BATCH_MS);
+  _flushHeldReplies() {
+    for (const o of this._heldReplies.splice(0)) this._cb?.onMessage?.(this.streamId, o);
   }
 
-  // Emit the pending batch as one seq-stamped frame.
-  _flushBatch() {
-    if (this._batchTimer) { clearTimeout(this._batchTimer); this._batchTimer = null; }
-    const b = this._batch;
-    if (!b) return;
-    this._batch = null;
-    if (b.t === 'delta') this._cb?.onDelta?.(this.streamId, b.text, this._seq++, b.blockId);
-    else this._cb?.onInputDelta?.(this.streamId, b.text, this._seq++, b.blockId);
+  _emitFrame(frame) {
+    if (frame.t === 'start') {
+      this._cb?.onBlockStart?.(
+        this.streamId,
+        frame.blockId,
+        frame.kind,
+        frame.name,
+      );
+    } else if (frame.t === 'delta') {
+      this._cb?.onDelta?.(this.streamId, frame.chunk, frame.blockId);
+    } else if (frame.t === 'input') {
+      this._cb?.onInputDelta?.(this.streamId, frame.chunk, frame.blockId);
+    } else if (frame.t === 'stop') {
+      this._cb?.onBlockStop?.(this.streamId, frame.blockId);
+    }
   }
 
   _onClose(code, detail) {
+    if (this.dead) return;
+    const wasBusy = this.busy;
     this.dead = true;
-    if (this._batchTimer) { clearTimeout(this._batchTimer); this._batchTimer = null; }
-    this._batch = null;
-    this.pool._remove(this.key);
-    // Process left the pool (reap/LRU/crash) — its turn can't finish, so settle to completed.
-    if (this.sessionId) this.pool._onExit?.(this.sessionId);
+    this._framer.cancel();
+    this.pool._remove(this.key, this);
+    if (this.sessionId && wasBusy) this.pool._onExit?.(this.sessionId);
     const cb = this._cb; this._cb = null;
     cb?.onError?.(this.streamId, { code, detail });
-    // Fail any queued sends
-    const q = this.queue; this.queue = [];
-    for (const item of q) item.cb?.onError?.(item.streamId, { code, detail });
     const waiters = this._initWaiters; this._initWaiters = [];
     for (const w of waiters) w(null);
+    for (const pending of this._pendingCtl.values()) {
+      clearTimeout(pending.timer);
+      pending.reject(new Error(detail || `Claude Code exited with code ${code}.`));
+    }
+    this._pendingCtl.clear();
   }
 
   waitInit(timeoutMs) {
@@ -194,31 +246,66 @@ class HeadlessProc {
 
   // Write one user message and bind this turn's callbacks.
   _writeTurn(text, streamId, cb) {
+    const uuid = userMessageUuidForTurnId(streamId) || streamId || randomUUID();
+    if (this.inputs.has(uuid)) return;
+    if (!this.busy) {
+      this.streamId = streamId;
+      this._cb = cb;
+      this._blockId = -1;
+      this._framer.reset();
+    }
     this.busy = true;
-    this.streamId = streamId;
-    this._cb = cb;
-    this._blockId = -1;
-    this._seq = 0; // reset per turn — seq is scoped to one streamId
+    this.inputs.set(uuid, { streamId, consumed: false });
     this.pool._touch(this);
-    const msg = { type: 'user', message: { role: 'user', content: [{ type: 'text', text }] } };
+    const msg = {
+      type: 'user',
+      ...(uuid ? { uuid } : {}),
+      message: { role: 'user', content: [{ type: 'text', text }] },
+    };
     try { this.stdin.write(JSON.stringify(msg) + '\n'); }
     catch (err) { this._onClose(-1, err.message); }
   }
 
-  enqueue(text, streamId, cb) {
-    this.queue.push({ text, streamId, cb });
+  requestControl(request, timeoutMs = HEADLESS_INIT_TIMEOUT_MS) {
+    if (this.dead || !this.stdin) {
+      return Promise.reject(new Error('Claude Code process is unavailable.'));
+    }
+    const rid = 'ctl-' + Date.now() + '-' + Math.random().toString(36).slice(2);
+    return new Promise((resolve, reject) => {
+      const timer = setTimeout(() => {
+        if (!this._pendingCtl.delete(rid)) return;
+        reject(new Error(`Claude Code ${request.subtype || 'control'} request timed out.`));
+      }, timeoutMs);
+      this._pendingCtl.set(rid, { resolve, reject, timer });
+      try {
+        this.stdin.write(JSON.stringify({
+          type: 'control_request',
+          request_id: rid,
+          request,
+        }) + '\n');
+      } catch (error) {
+        clearTimeout(timer);
+        this._pendingCtl.delete(rid);
+        reject(error);
+      }
+    });
   }
 
-  _drainQueue() {
-    if (this.busy || this.dead || this.queue.length === 0) return;
-    const item = this.queue.shift();
-    this._writeTurn(item.text, item.streamId, item.cb);
-  }
-
-  // Interrupt the current turn: SIGINT the process (headless has no Esc).
-  interrupt() {
-    if (this.dead || !this.proc) return;
-    try { this.proc.kill('SIGINT'); } catch {}
+  // Interrupt the current turn via stdin control_request — CC gracefully aborts and flushes
+  // the partial content + [Request interrupted by user] to jsonl (verified CC 2.1.220). SIGINT
+  // is the fallback (hard kill, no jsonl) when CC doesn't ack in 5s. Mirrors alleycat.
+  async interrupt() {
+    if (this.dead || !this.proc || !this.busy) return false;
+    try {
+      await this.requestControl({ subtype: 'interrupt' }, 5000);
+      return true;
+    } catch {
+      try {
+        return this.proc.kill('SIGINT');
+      } catch {
+        return false;
+      }
+    }
   }
 
   shutdown() {
@@ -233,6 +320,10 @@ export class ClaudePool {
     this.idleTtl = opts.idleTtl ?? HEADLESS_IDLE_TTL_MS;
     this.maxProcs = opts.maxProcs ?? HEADLESS_MAX_PROCS;
     this.initTimeout = opts.initTimeout ?? HEADLESS_INIT_TIMEOUT_MS;
+    this.bin = opts.bin || '';
+    this.env = opts.env || null;
+    this._inspectPending = new Map();
+    this._inspectProcs = new Set();
     this._onExit = opts.onExit || null;  // (sessionId) => void, fired when a proc leaves the pool
     this._reaper = setInterval(() => this.reapIdle(), HEADLESS_REAP_INTERVAL_MS);
     if (this._reaper.unref) this._reaper.unref();
@@ -240,7 +331,8 @@ export class ClaudePool {
 
   _touch(proc) { proc.lastActiveAt = Date.now(); }
 
-  _remove(key) { this.procs.delete(key); }
+  // A reaped process can exit long after its key was respawned; it must not drop the live one.
+  _remove(key, proc) { if (this.procs.get(key) === proc) this.procs.delete(key); }
 
   // Send a message to sessionId's process (spawn/reuse/queue). Returns
   // { sessionId, bgLocked }: sessionId resolved from system/init (or upfront for
@@ -248,6 +340,7 @@ export class ClaudePool {
   // guard (caller then stopDaemon + retries). resumeId → --resume; createId → new
   // session via --session-id (sessionId known upfront, no init wait needed to return it).
   async send(key, text, opts = {}) {
+    if (!this.bin) requireClaudeBin();
     const streamId = opts.streamId || null;
     const cb = {
       onDelta: opts.onDelta,
@@ -258,6 +351,7 @@ export class ClaudePool {
       onResult: opts.onResult,
       onControlRequest: opts.onControlRequest,
       onError: opts.onError,
+      onInputConsumed: opts.onInputConsumed,
     };
 
     let proc = this.procs.get(key);
@@ -275,14 +369,102 @@ export class ClaudePool {
       return { sessionId: proc.sessionId, bgLocked: false };
     }
 
-    if (proc.busy) proc.enqueue(text, streamId, cb);
-    else proc._writeTurn(text, streamId, cb);
+    proc._writeTurn(text, streamId, cb);
     return { sessionId: proc.sessionId, bgLocked: false };
+  }
+
+  // Read the same runtime-filtered catalogs used by Claude Code's TUI without
+  // creating or persisting a conversation.
+  async inspect(cwd) {
+    const existing = this._inspectPending.get(cwd);
+    if (existing) return existing;
+    const pending = this._inspect(cwd);
+    this._inspectPending.set(cwd, pending);
+    try {
+      return await pending;
+    } finally {
+      if (this._inspectPending.get(cwd) === pending) this._inspectPending.delete(cwd);
+    }
+  }
+
+  async _inspect(cwd) {
+    if (!this.bin) requireClaudeBin();
+    const key = 'inspect-' + Date.now() + '-' + Math.random().toString(36).slice(2);
+    const proc = new HeadlessProc(this, key, cwd, null, null, { noPersistence: true });
+    this._inspectProcs.add(proc);
+    proc.spawn();
+    try {
+      return await proc.requestControl({ subtype: 'initialize' }, this.initTimeout);
+    } finally {
+      this._inspectProcs.delete(proc);
+      proc.shutdown();
+    }
+  }
+
+  async inspectSession(key, cwd, subtypes) {
+    if (!this.bin) requireClaudeBin();
+    let proc = this.procs.get(key);
+    let temporary = false;
+    if (!proc || proc.dead) {
+      const inspectKey = 'inspect-session-' + Date.now() + '-' + Math.random().toString(36).slice(2);
+      proc = new HeadlessProc(this, inspectKey, cwd, key, null, { noPersistence: true });
+      this._inspectProcs.add(proc);
+      proc.spawn();
+      temporary = true;
+    }
+
+    const result = {};
+    const errors = {};
+    try {
+      for (const subtype of subtypes) {
+        try {
+          result[subtype] = await proc.requestControl({ subtype }, this.initTimeout);
+        } catch (error) {
+          errors[subtype] = error.message || String(error);
+        }
+      }
+    } finally {
+      if (temporary) {
+        this._inspectProcs.delete(proc);
+        proc.shutdown();
+      }
+    }
+    return { result, errors };
+  }
+
+  async renameSession(key, cwd, title) {
+    let proc = this.procs.get(key);
+    let temporary = false;
+    if (!proc || proc.dead) {
+      const renameKey = 'rename-session-' + key;
+      proc = new HeadlessProc(this, renameKey, cwd, key, null, { bare: true });
+      this._inspectProcs.add(proc);
+      proc.spawn();
+      temporary = true;
+    }
+    try {
+      if (temporary) await proc.requestControl({ subtype: 'initialize' }, this.initTimeout);
+      await proc.requestControl({
+        subtype: 'rename_session', title, source: 'host', session_id: key,
+      }, this.initTimeout);
+      this._touch(proc);
+    } finally {
+      if (temporary) {
+        this._inspectProcs.delete(proc);
+        if (!proc.dead) {
+          await new Promise(resolve => {
+            const timeout = setTimeout(() => proc.proc.kill(), 5000);
+            proc.proc.once('close', () => { clearTimeout(timeout); resolve(); });
+            proc.shutdown();
+          });
+        }
+      }
+    }
   }
 
   // Release a daemon-held (bg-agent) session so --resume can take it over. `claude stop` blocks until released (~200ms) — no polling needed.
   stopDaemon(sessionId) {
-    const bin = resolveClaudeBin() || 'claude';
+    const bin = this.bin || resolveClaudeBin() || 'claude';
     try {
       execFileSync(bin, ['stop', sessionId.slice(0, 8)], { stdio: 'ignore', timeout: 10000 });
       return true;
@@ -298,21 +480,17 @@ export class ClaudePool {
     catch { return false; }
   }
 
-  // Send a plain user text message (used for AskUserQuestion answer after deny).
-  sendRaw(key, text) {
+  async interrupt(key) {
     const proc = this.procs.get(key);
-    if (!proc || proc.dead) return false;
-    const msg = { type: 'user', message: { role: 'user', content: [{ type: 'text', text }] } };
-    try { proc.stdin.write(JSON.stringify(msg) + '\n'); return true; }
-    catch { return false; }
+    if (!proc || proc.dead || !proc.busy) return false;
+    return proc.interrupt();
   }
 
-  interrupt(key) { this.procs.get(key)?.interrupt(); }
-
-  // True while a live process exists for this session (pool owns its status).
+  // True while a live process exists for this session.
   owns(key) { const p = this.procs.get(key); return !!p && !p.dead; }
 
-  isBusy(key) { const p = this.procs.get(key); return !!p && !p.dead && (p.busy || Date.now() < (p._graceUntil || 0)); }
+  // Busy turns own status; idle processes may be resumed from a terminal.
+  isBusy(key) { const p = this.procs.get(key); return !!p && !p.dead && p.busy; }
 
   reapIdle() {
     const now = Date.now();
@@ -337,6 +515,8 @@ export class ClaudePool {
   shutdownAll() {
     clearInterval(this._reaper);
     for (const proc of this.procs.values()) proc.shutdown();
+    for (const proc of this._inspectProcs) proc.shutdown();
     this.procs.clear();
+    this._inspectProcs.clear();
   }
 }

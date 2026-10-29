@@ -1,3 +1,7 @@
+import { extractAttachments, fileAttachmentHtml } from './attachment.js';
+import { systemEventId } from '../timeline.js';
+import { copyButtonHtml } from '../copy.js';
+
 // Message bubble components
 (function () {
   function esc(str) {
@@ -7,6 +11,17 @@
   function fmtTime(ts) {
     return ts ? new Date(ts).toLocaleTimeString() : '';
   }
+
+  function contentText(msg) {
+    if (typeof msg.content === 'string') return msg.content;
+    if (Array.isArray(msg.content)) return msg.content.map(b => b.text || '').join('');
+    return JSON.stringify(msg.content);
+  }
+
+  const CODEX_COMPACTION_PREFIX = 'Another language model started to solve this problem and produced a summary of its thinking process. '
+    + 'You also have access to the state of the tools that were used by that language model. '
+    + 'Use this to build on the work that has already been done and avoid duplicating work. '
+    + 'Here is the summary produced by the other language model, use the information in this summary to assist with your own analysis:';
 
   // Interrupt text mapping (same as Claude Code)
   const INTERRUPT_MAP = {
@@ -34,6 +49,12 @@
     return '';
   }
 
+  window.isSubagentNotificationMsg = function (msg) {
+    return msg.type === 'user'
+      && /^\s*<subagent_notification>[\s\S]*<\/subagent_notification>\s*$/i
+        .test(userText(msg));
+  };
+
   // CC writes a local command's stdout back as a user message wrapped in
   // <local-command-stdout> (e.g. /compact's "Compacted" summary). It's command
   // output, not a user turn — render it like captured command output, not a bubble.
@@ -49,60 +70,6 @@
     var t = userText(msg);
     if (/^\s*<(?:local-command-caveat|task-notification|system-reminder)/.test(t)) return true;
     if (/^\s*<command-name>\/?clear<\/command-name>/.test(t)) return true;
-    return false;
-  };
-
-  // Spinner's single source of truth: walk the tail to the last real turn.
-  // Assistant pre-end_turn / user awaiting reply → running; else not running.
-  // authStatus (optional): bridge's session status; for a trailing lone `user` entry
-  // (ambiguous in the stream), trust authStatus==='completed' over the stream.
-  // True if this tool_result answers an AskUserQuestion/ExitPlanMode (is_error but not an interrupt — CC resumes).
-  window.isInteractiveToolResult = function (msg, messages) {
-    if (!Array.isArray(msg.content)) return false;
-    var ids = {};
-    for (var i = 0; i < messages.length; i++) {
-      var c = messages[i] && messages[i].content;
-      if (!Array.isArray(c)) continue;
-      for (var j = 0; j < c.length; j++) {
-        if (c[j].type === 'tool_use' && (c[j].name === 'AskUserQuestion' || c[j].name === 'ExitPlanMode' || c[j].name === 'exit_plan_mode')) ids[c[j].id] = true;
-      }
-    }
-    // An answered ask/plan keeps CC running (summary follows); a cancelled one (rejection text) does not.
-    return msg.content.some(function (b) {
-      if (b.type !== 'tool_result' || !ids[b.tool_use_id]) return false;
-      var t = typeof b.content === 'string' ? b.content : (Array.isArray(b.content) ? b.content.map(function (x) { return x.text || ''; }).join('') : '');
-      return t.indexOf('tool use was rejected') === -1;
-    });
-  };
-
-  window.deriveRunning = function (messages, authStatus) {
-    if (!Array.isArray(messages)) return false;
-    var atTail = true; // first status-relevant message seen = the tail (what bridge inspects)
-    for (var i = messages.length - 1; i >= 0; i--) {
-      var m = messages[i];
-      if (!m) continue;
-      if (m.type === 'ai-title' || m.type === 'custom-title' || m.type === 'last-prompt') continue;
-      if (window.isLocalCommandStdout(m)) return false;
-      // Match bridge statusFromEntry: only streaming (null) / tool_use are running;
-      // end_turn / max_tokens / stop_sequence are a finished turn → not running.
-      if (m.type === 'assistant') return m.stopReason == null || m.stopReason === 'tool_use';
-      if (m.type === 'user') {
-        if (window.isInterruptMsg(m)) return false;
-        if (window.isLocalCommandMarker(m)) return false;
-        if (window.isToolResultOnly(m)) {
-          // Tail error-only tool_result = interrupt → idle (but an answered ask/plan OUT is running, not idle).
-          if (atTail && Array.isArray(m.content) && m.content.every(function (b) { return b.is_error; })
-            && !window.isInteractiveToolResult(m, messages)) return false;
-          atTail = false;
-          continue;
-        }
-        // Real user turn awaiting a reply — the ambiguous case. Defer to the
-        // bridge's verdict when it says the turn is done (only at tail).
-        if (atTail && authStatus === 'completed') return false;
-        return true;
-      }
-      atTail = false;
-    }
     return false;
   };
 
@@ -130,7 +97,8 @@
   }
 
   // Render user text bubble
-  window.renderUserBubble = function (msg) {
+  window.renderUserBubble = function (msg, extraClass) {
+    if (window.isSubagentNotificationMsg(msg)) return '';
     let text = '';
     if (typeof msg.content === 'string') text = msg.content;
     else if (Array.isArray(msg.content)) {
@@ -172,15 +140,20 @@
       ? msg.content.filter(b => b.type === 'image' && b.key)
       : [];
 
-    // Parse ![](path) markdown image refs in text (from claude-bridge image sends)
+    // Parse ![](path) image refs from Baton image sends only: the app's
+    // baton-bridge:<key>, or the ~/.baton-bridge/tmp path Bridge rewrites it to.
+    // Any other markdown image is user-typed text and stays in the bubble.
     const mdImages = [];
-    text = text.replace(/!\[.*?\]\(([^)]+)\)\n?/g, (_, imgPath) => {
+    text = text.replace(/!\[.*?\]\(([^)]+)\)\n?/g, (match, imgPath) => {
+      if (!/^baton-bridge:|[\\/]\.baton-bridge[\\/]tmp[\\/]/.test(imgPath)) return match;
       mdImages.push(imgPath);
       return '';
     });
 
     // Build attachments row (file badges + images)
-    const badges = [];
+    const attachments = extractAttachments(text);
+    text = attachments.text;
+    const badges = attachments.files.map(fileAttachmentHtml);
     ideFiles.forEach(p => {
       const name = p.split('/').pop();
       badges.push(fileBadge(name, p, p));
@@ -193,9 +166,9 @@
       badges.push(`<div class="img-placeholder" data-key="${esc(b.key)}"><svg class="img-spinner" viewBox="0 0 36 36"><circle cx="18" cy="18" r="14" fill="none" stroke="rgba(255,255,255,0.15)" stroke-width="3"/><circle cx="18" cy="18" r="14" fill="none" stroke="#8b949e" stroke-width="3" stroke-dasharray="80" stroke-dashoffset="60" stroke-linecap="round"><animateTransform attributeName="transform" type="rotate" from="0 18 18" to="360 18 18" dur="1s" repeatCount="indefinite"/></circle></svg></div>`);
     });
     mdImages.forEach(imgPath => {
-      // Extract image key: from "claude-bridge:key" or filename from absolute path
-      const cbMatch = imgPath.match(/claude-bridge:(.+)/);
-      const key = cbMatch ? cbMatch[1] : imgPath.split('/').pop();
+      // Extract image key: from "baton-bridge:key" or filename from absolute path
+      const cbMatch = imgPath.match(/baton-bridge:(.+)/);
+      const key = cbMatch ? cbMatch[1] : imgPath.split(/[\\/]/).pop();
       if (key && key.match(/\.(jpg|png|jpeg)$/i)) {
         badges.push(`<div class="img-placeholder" data-key="${esc(key)}"><svg class="img-spinner" viewBox="0 0 36 36"><circle cx="18" cy="18" r="14" fill="none" stroke="rgba(255,255,255,0.15)" stroke-width="3"/><circle cx="18" cy="18" r="14" fill="none" stroke="#8b949e" stroke-width="3" stroke-dasharray="80" stroke-dashoffset="60" stroke-linecap="round"><animateTransform attributeName="transform" type="rotate" from="0 18 18" to="360 18 18" dur="1s" repeatCount="indefinite"/></circle></svg></div>`);
       }
@@ -203,12 +176,22 @@
     const attachHtml = badges.length ? `<div class="msg-attachments">${badges.join('')}</div>` : '';
 
     const displayText = slashCmd ? `/${slashCmd}${text.trim() ? ' ' + text.trim() : ''}` : text.trim();
+    const escapedText = esc(displayText);
+    const displayHtml = window.linkifyPreviewAddresses
+      ? window.linkifyPreviewAddresses(escapedText) : escapedText;
 
     if (!displayText && !attachHtml) return '';
-    return `<div class="msg-user"${msg.timestamp ? ` data-ts="${esc(msg.timestamp)}"` : ''}>
+    const nativeTurn = String(msg.nativeId || '')
+      .match(/^(?:codex|live):user:(.+)$/)?.[1] || '';
+    const anchorId = msg.turnId || nativeTurn || (msg.nativeId ? msg.uuid : `sent-${msg.uuid}`);
+    const anchorAttr = anchorId ? ` data-anchor="${esc(anchorId)}"` : '';
+    const messageAttr = msg.uuid ? ` data-message-id="${esc(msg.uuid)}"` : '';
+    const nativeAttr = msg.nativeId ? ` data-native-id="${esc(msg.nativeId)}"` : '';
+    const className = `msg-user${extraClass ? ` ${extraClass}` : ''}`;
+    return `<div class="${className}"${displayText ? ' data-message-actions' : ''}${anchorAttr}${messageAttr}${nativeAttr}${msg.timestamp ? ` data-ts="${esc(msg.timestamp)}"` : ''}>
       ${attachHtml}
-      ${displayText ? `<div class="msg-text" onclick="toggleExpand(this)">${esc(displayText)}</div>` : ''}
-      <div class="msg-meta"><span class="msg-time">${fmtTime(msg.timestamp)}</span></div>
+      ${displayText ? `<div class="msg-text" onclick="if(!event.target.closest('a'))toggleExpand(this)">${displayHtml}</div>` : ''}
+      <div class="msg-meta"><span class="msg-time">${fmtTime(msg.timestamp)}</span>${displayText ? copyButtonHtml('message') : ''}</div>
     </div>`;
   };
 
@@ -222,31 +205,58 @@
   window.renderThinking = function (block) {
     const secs = Math.round((block.duration_ms || 0) / 1000);
     const label = secs > 0 ? `Thought for ${secs}s` : 'Thinking';
+    const duration = Number.isFinite(block.duration_ms)
+      ? ` data-thinking-duration-ms="${Math.max(0, block.duration_ms)}"` : '';
     const id = 'think-' + Math.random().toString(36).slice(2, 8);
-    return `<div class="thinking-block">
-      <div class="thinking-toggle" onclick="this.classList.toggle('open');var b=document.getElementById('${id}');b.style.display=b.style.display==='block'?'none':'block'">${label} <span class="thinking-chevron">&#8250;</span></div>
+    return `<div class="thinking-block"${duration}>
+      <div class="thinking-toggle" onclick="var b=document.getElementById('${id}');if(!b.textContent.trim())return;this.classList.toggle('open');b.style.display=b.style.display==='block'?'none':'block'"><span class="thinking-label">${label}</span> <span class="thinking-chevron">&#8250;</span></div>
       <div class="thinking-body" id="${id}">${esc(block.thinking || '')}</div>
     </div>`;
   };
 
-  // Render system / summary / ai-title
+  window.renderSystemEvent = function (msg) {
+    const content = contentText(msg);
+    if (!content) return '';
+    const segment = esc(systemEventId(msg)).replace(/"/g, '&quot;');
+    return `<div class="msg-system-event" data-timeline-segment="${segment}"${msg.timestamp ? ` data-ts="${esc(msg.timestamp)}"` : ''}><span>${esc(content)}</span></div>`;
+  };
+
+  window.renderSummary = function (msg) {
+    let content = contentText(msg).trim();
+    if (content.startsWith(CODEX_COMPACTION_PREFIX)) {
+      content = content.slice(CODEX_COMPACTION_PREFIX.length).trim();
+    }
+    if (!content) return '';
+    return `<details class="summary-block">
+      <summary><span>Context compacted</span><span class="summary-chevron">&#8250;</span></summary>
+      <div class="summary-body assistant-text">${renderAssistantText(content)}</div>
+    </details>`;
+  };
+
+  // Render system / ai-title
   window.renderSystemMsg = function (msg) {
-    const content = typeof msg.content === 'string' ? msg.content
-      : Array.isArray(msg.content) ? msg.content.map(b => b.text || '').join('')
-      : JSON.stringify(msg.content);
+    const content = contentText(msg);
     if (msg.type === 'ai-title') {
       return `<div class="msg-ai-title">${esc(content)}</div>`;
     }
     return `<div class="msg-system">${esc(content)}</div>`;
   };
-  // Render a <local-command-stdout> user message (e.g. /compact result) as command
-  // output: strip the wrapper tags + ANSI escape codes, show as a clean cmd-output.
-  window.renderLocalCommandStdout = function (msg) {
-    var text = userText(msg)
+  function localCommandStdoutText(msg) {
+    return userText(msg)
       .replace(/<\/?local-command-stdout>/g, '')
       .replace(/\x1b\[[0-9;]*m/g, '') // strip ANSI colour codes
       .replace(/\[\d+m/g, '')         // strip bare [2m/[22m the terminal echoed
       .trim();
+  }
+  // Forked skills echo a plain /command and their stdout is the skill's reply;
+  // built-in local commands use XML tags.
+  window.renderForkedSkillSummary = function (msg, command) {
+    if (command?.type !== 'user' || !/^\/[\w:-]+(?:\s|$)/.test(userText(command).trim())) return '';
+    var text = localCommandStdoutText(msg);
+    return text ? renderAssistantText(text) : '';
+  };
+  window.renderLocalCommandStdout = function (msg) {
+    var text = localCommandStdoutText(msg);
     if (!text) return '';
     return `<div class="cmd-output"${msg.timestamp ? ` data-ts="${esc(msg.timestamp)}"` : ''}><pre>${esc(text)}</pre></div>`;
   };
@@ -257,6 +267,8 @@
   window.toggleExpand = function (el) {
     var sel = window.getSelection();
     if (sel && sel.toString().length > 0) return;
+    var preview = el.closest('.tool-body-content[data-tool-preview]');
+    if (preview) return window.loadToolDetailsMore?.(preview.querySelector('.tool-preview-more'));
     if (el.classList.contains('msg-text')) {
       el.classList.toggle('clamped');
       el.classList.toggle('expanded');
@@ -281,13 +293,24 @@
       }
     });
     container.querySelectorAll('.tool-value.clamp:not(.expanded)').forEach(function (el) {
+      if (el.closest('[data-tool-preview]')) return;
       if (el.scrollHeight > el.clientHeight + 2 && !el.querySelector('.clamp-btn')) el.insertAdjacentHTML('beforeend', BTN);
     });
     container.querySelectorAll('.tool-body-content.collapsible:not(.open)').forEach(function (el) {
+      if (el.hasAttribute('data-tool-preview')) return;
       if (!el.querySelector('.clamp-btn')) el.insertAdjacentHTML('beforeend', BTN);
+    });
+    container.querySelectorAll('.tool-body-content:not(.collapsible) .diff-container').forEach(function (diff) {
+      if (diff.closest('[data-tool-preview]')) return;
+      if (diff.scrollHeight <= 240) return;
+      var body = diff.closest('.tool-body-content');
+      if (!body) return;
+      body.classList.add('collapsible');
+      if (!body.querySelector('.clamp-btn')) body.insertAdjacentHTML('beforeend', BTN);
     });
     // Tool body with clamped .tool-value children (Bash IN/OUT, etc.)
     container.querySelectorAll('.tool-body-content:not(.open):not(.no-clamp):not(.collapsible)').forEach(function (el) {
+      if (el.hasAttribute('data-tool-preview')) return;
       if (el.querySelector('.clamp-btn')) return;
       var hasOverflow = false;
       el.querySelectorAll('.tool-value').forEach(function (v) {

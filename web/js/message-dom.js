@@ -1,0 +1,611 @@
+import { attachTimelineTurn, messageSegments, turnTimeline } from './timeline.js';
+
+function domKey(element) {
+  if (!element) return '';
+  var messageId = element.dataset?.messageId || '';
+  var nativeId = element.dataset?.nativeId || '';
+  var toolId = element.dataset?.toolId || '';
+  if (messageId) return 'uuid:' + messageId + (toolId ? ':tool:' + toolId : '');
+  if (nativeId) return 'native:' + nativeId + (toolId ? ':tool:' + toolId : '');
+  if (toolId) return 'tool:' + toolId;
+  if (element.classList?.contains('msg-user')) {
+    return 'user:' + (element.dataset.anchor
+      || element.dataset.messageId
+      || element.dataset.nativeId
+      || element.dataset.ts
+      || '');
+  }
+  var firstIdentity = element.querySelector?.(
+    '[data-message-id], [data-native-id], [data-tool-id]',
+  );
+  if (firstIdentity) return 'group:' + domKey(firstIdentity);
+  return 'fallback:' + (element.className || '')
+    + ':' + (element.dataset?.ts || '')
+    + ':' + (element.textContent || '').trim();
+}
+
+function comparableMarkup(element) {
+  var clone = element.cloneNode(true);
+  var nodes = [clone].concat(Array.from(clone.querySelectorAll('*')));
+  for (var node of nodes) {
+    if (node.classList?.contains('img-placeholder') && (node.hasAttribute('data-key') || node.hasAttribute('data-path'))) {
+      node.classList.remove('loaded');
+      node.removeAttribute('data-loaded');
+      node.removeAttribute('data-failed');
+      node.replaceChildren();
+    }
+    node.classList?.remove(
+      'tool-details-collapsed',
+      'expanded-desc',
+      'expanded',
+      'clamped',
+      'open',
+      'copy-tail',
+    );
+    if (node.getAttribute('class') === '') node.removeAttribute('class');
+    node.removeAttribute?.('aria-expanded');
+    node.removeAttribute?.('data-tool-details-group');
+    if (node.classList?.contains('tool-body-content')
+      && String(node.id || '').indexOf('tool-') === 0) {
+      node.removeAttribute('id');
+    }
+  }
+  for (var button of clone.querySelectorAll('.clamp-btn, .message-action')) button.remove();
+  return clone.outerHTML;
+}
+
+function nodeUnchanged(current, expected) {
+  if (!current || !expected || current.tagName !== expected.tagName) return false;
+  return domKey(current) === domKey(expected)
+    && comparableMarkup(current) === comparableMarkup(expected);
+}
+
+function sameUserAnchor(current, expected) {
+  if (!current?.classList.contains('msg-user')
+    || !expected?.classList.contains('msg-user')) {
+    return false;
+  }
+  var currentAnchor = current.dataset?.anchor || '';
+  var expectedAnchor = expected.dataset?.anchor || '';
+  return !!currentAnchor && currentAnchor === expectedAnchor;
+}
+
+function syncUserIdentity(current, expected) {
+  if (!current || !expected) return;
+  for (var attribute of ['data-anchor', 'data-message-id', 'data-native-id']) {
+    if (expected.hasAttribute(attribute)) {
+      current.setAttribute(attribute, expected.getAttribute(attribute));
+    }
+  }
+  if (expected.dataset?.ts) current.dataset.serverTs = expected.dataset.ts;
+}
+
+function inheritUiState(current, expected) {
+  if (!current || !expected) return;
+  if (current.classList.contains('thinking-tl')
+    && expected.classList.contains('thinking-tl')) {
+    var currentThinking = current.querySelector('.thinking-block');
+    var expectedThinking = expected.querySelector('.thinking-block');
+    if (currentThinking?.hasAttribute('data-thinking-duration-ms')
+      && expectedThinking && !expectedThinking.hasAttribute('data-thinking-duration-ms')) {
+      expectedThinking.dataset.thinkingDurationMs = currentThinking.dataset.thinkingDurationMs;
+    }
+  }
+  if (current.classList.contains('tool-node')
+    && expected.classList.contains('tool-node')
+    && current.querySelector(':scope > .tool-header.tool-details-toggle')) {
+    var collapsed = current.classList.contains('tool-details-collapsed');
+    expected.classList.toggle('tool-details-collapsed', collapsed);
+    var header = expected.querySelector(':scope > .tool-header');
+    if (header?.classList.contains('tool-details-toggle')) {
+      header.setAttribute('aria-expanded', String(!collapsed));
+    }
+  }
+}
+
+function syncElementInPlace(current, expected) {
+  inheritUiState(current, expected);
+  current.className = expected.className;
+  for (var attribute of Array.from(current.attributes)) {
+    if (attribute.name === 'class') continue;
+    if (!expected.hasAttribute(attribute.name)) {
+      current.removeAttribute(attribute.name);
+    }
+  }
+  for (var expectedAttribute of Array.from(expected.attributes)) {
+    if (expectedAttribute.name !== 'class') {
+      current.setAttribute(expectedAttribute.name, expectedAttribute.value);
+    }
+  }
+  current.innerHTML = expected.innerHTML;
+  return current;
+}
+
+function assistantTurnsShareIdentity(current, expected) {
+  if (!current?.classList.contains('assistant-turn')
+    || !expected?.classList.contains('assistant-turn')) {
+    return false;
+  }
+  var currentChildren = Array.from(current.children);
+  for (var expectedChild of Array.from(expected.children)) {
+    var expectedKey = domKey(expectedChild);
+    if (expectedKey
+      && expectedKey.indexOf('fallback:') !== 0
+      && currentChildren.some(function (currentChild) {
+        return domKey(currentChild) === expectedKey;
+      })) {
+      return true;
+    }
+    var toolId = expectedChild.dataset?.toolId || '';
+    if (toolId && currentChildren.some(function (currentChild) {
+      return currentChild.dataset?.toolId === toolId;
+    })) {
+      return true;
+    }
+  }
+  return false;
+}
+
+function matchingStreamTurns(container, streamRow) {
+  var turnId = streamRow?.dataset?.turnId || '';
+  // REST/DDB rows carry no turnId; rows between this turn's prompt and the next one are its own.
+  var timeline = turnId ? turnTimeline(container, turnId) : null;
+  var ownRows = timeline?.anchor ? timeline.rows : [];
+  return Array.from(container.children).filter(function (element) {
+    if (element === streamRow
+      || !element.classList.contains('assistant-turn')
+      || (element.dataset.timelineSegment || '') !== (streamRow.dataset.timelineSegment || '')) {
+      return false;
+    }
+    var recoveredTurnId = element.dataset?.turnId || '';
+    if (turnId && recoveredTurnId === turnId) return true;
+    return !recoveredTurnId
+      && (ownRows.includes(element) || assistantTurnsShareIdentity(streamRow, element));
+  });
+}
+
+function streamChildrenCompatible(current, expected) {
+  if (!current?.dataset?.blockId || !expected) return false;
+  for (var className of ['assistant-text', 'thinking-tl', 'tool-node']) {
+    if (current.classList.contains(className)
+      || expected.classList.contains(className)) {
+      return current.classList.contains(className)
+        && expected.classList.contains(className);
+    }
+  }
+  return false;
+}
+
+function reconcileChildren(parent, expectedParent) {
+  var existing = Array.from(parent.children);
+  var used = new Set();
+  var byKey = new Map();
+  for (var element of existing) {
+    var key = domKey(element);
+    if (!byKey.has(key)) byKey.set(key, []);
+    byKey.get(key).push(element);
+  }
+
+  var cursor = parent.firstElementChild;
+  for (var expected of Array.from(expectedParent.children)) {
+    var candidates = byKey.get(domKey(expected)) || [];
+    var current = candidates.find(function (candidate) {
+      return !used.has(candidate);
+    }) || null;
+    if (!current && expected.dataset?.toolId) {
+      current = existing.find(function (candidate) {
+        return !used.has(candidate)
+          && candidate.dataset?.toolId === expected.dataset.toolId;
+      }) || null;
+    }
+    if (!current
+      && (parent.classList.contains('stream-preview')
+        || parent.classList.contains('stream-committed'))) {
+      current = existing.find(function (candidate) {
+        return !used.has(candidate)
+          && streamChildrenCompatible(candidate, expected);
+      }) || null;
+    }
+    var resolved;
+    if (current && nodeUnchanged(current, expected)) {
+      used.add(current);
+      resolved = current;
+      if (resolved !== cursor) parent.insertBefore(resolved, cursor);
+    } else {
+      inheritUiState(current, expected);
+      resolved = expected;
+      parent.insertBefore(resolved, cursor);
+      if (current) {
+        used.add(current);
+        current.remove();
+      }
+    }
+    cursor = resolved.nextElementSibling;
+  }
+
+  for (var stale of existing) {
+    if (!used.has(stale) && stale.isConnected) stale.remove();
+  }
+}
+
+function reconcileTopLevel(container, expected) {
+  var existing = Array.from(container.children);
+  var used = new Set();
+  var byKey = new Map();
+  for (var element of existing) {
+    var key = domKey(element);
+    if (!byKey.has(key)) byKey.set(key, []);
+    byKey.get(key).push(element);
+  }
+
+  var cursor = container.firstElementChild;
+  for (var expectedElement of Array.from(expected.children)) {
+    var key = domKey(expectedElement);
+    var candidates = byKey.get(key) || [];
+    var current = candidates.find(function (candidate) {
+      return !used.has(candidate);
+    }) || null;
+    if (!current
+      && expectedElement.classList.contains('assistant-turn')
+      && expectedElement.dataset?.turnId) {
+      current = existing.find(function (candidate) {
+        return !used.has(candidate)
+          && candidate.classList.contains('assistant-turn')
+          && (candidate.dataset.timelineSegment || '') === (expectedElement.dataset.timelineSegment || '')
+          && candidate.dataset?.turnId === expectedElement.dataset.turnId;
+      }) || null;
+    }
+    if (!current && expectedElement.classList.contains('msg-user')) {
+      current = existing.find(function (candidate) {
+        return !used.has(candidate)
+          && sameUserAnchor(candidate, expectedElement);
+      }) || null;
+    }
+    var cursorKey = domKey(cursor);
+    if (!current
+      && cursor?.classList.contains('assistant-turn')
+      && expectedElement.classList.contains('assistant-turn')
+      && !cursor.dataset?.turnId
+      && cursorKey.indexOf('group:uuid:') !== 0
+      && !used.has(cursor)) {
+      current = cursor;
+    }
+
+    var resolved;
+    if (current && sameUserAnchor(current, expectedElement)) {
+      used.add(current);
+      syncUserIdentity(current, expectedElement);
+      resolved = current;
+    } else if (current?.classList.contains('assistant-turn')
+      && expectedElement.classList.contains('assistant-turn')) {
+      used.add(current);
+      reconcileChildren(current, expectedElement);
+      current.className = expectedElement.className;
+      for (var attribute of ['data-turn-id', 'data-ts', 'data-timeline-segment']) {
+        if (expectedElement.hasAttribute(attribute)) {
+          current.setAttribute(attribute, expectedElement.getAttribute(attribute));
+        } else {
+          current.removeAttribute(attribute);
+        }
+      }
+      resolved = current;
+      if (resolved !== cursor) {
+        container.insertBefore(resolved, cursor);
+      }
+    } else if (current && nodeUnchanged(current, expectedElement)) {
+      used.add(current);
+      resolved = current;
+      if (resolved !== cursor) {
+        container.insertBefore(resolved, cursor);
+      }
+    } else {
+      inheritUiState(current, expectedElement);
+      resolved = expectedElement;
+      container.insertBefore(resolved, cursor);
+      if (current) {
+        used.add(current);
+        current.remove();
+      }
+    }
+    cursor = resolved.nextElementSibling;
+  }
+
+  for (var stale of existing) {
+    if (!used.has(stale)
+      && stale.isConnected
+      && !stale.hasAttribute('data-pending-placeholder')
+      && !stale.hasAttribute('data-pending')
+      && !(stale.classList.contains('msg-user') && stale.dataset?.anchor)) {
+      stale.remove();
+    }
+  }
+}
+
+function elementSegment(element, segments) {
+  return segments.get('uuid:' + element.dataset.messageId)
+    ?? segments.get('native:' + element.dataset.nativeId)
+    ?? segments.get('tool:' + element.dataset.toolId);
+}
+
+function messageOrder(messages) {
+  var order = new Map();
+  messages.forEach(function (message, index) {
+    if (message.uuid) order.set('uuid:' + message.uuid, index);
+    if (message.nativeId) order.set('native:' + message.nativeId, index);
+    for (var block of Array.isArray(message.content) ? message.content : []) {
+      if (block?.type === 'tool_use' && block.id) order.set('tool:' + block.id, index);
+    }
+  });
+  return order;
+}
+
+// Provisional stream blocks have no identity yet and are always the newest.
+function elementOrder(element, order) {
+  return order.get('uuid:' + element.dataset.messageId)
+    ?? order.get('native:' + element.dataset.nativeId)
+    ?? order.get('tool:' + element.dataset.toolId)
+    ?? Infinity;
+}
+
+function rowOrder(element, order) {
+  return Math.min(elementOrder(element, order),
+    ...Array.from(element.children, child => elementOrder(child, order)));
+}
+
+// A Goal continuation has no user row to follow, so it keeps its message order.
+function insertByMessageOrder(container, row, order) {
+  var position = rowOrder(row, order);
+  var before = Array.from(container.children).find(element => element !== row
+    && (element.classList.contains('msg-user') || element.classList.contains('assistant-turn'))
+    && rowOrder(element, order) > position);
+  container.insertBefore(row, before || null);
+  return true;
+}
+
+function splitStreamRows(rows, segments, expected) {
+  var groups = new Map(rows.map(row => [
+    JSON.stringify([row.dataset.turnId, row.dataset.timelineSegment || '']), row,
+  ]));
+  for (var row of rows.slice()) {
+    var timeline = turnTimeline(expected, row.dataset.turnId || '');
+    for (var child of Array.from(row.children)) {
+      var provisional = row.classList.contains('stream-preview')
+        && !child.classList.contains('stream-block-committed')
+        && child.dataset.blockId && !child.dataset.messageId
+        && !child.dataset.nativeId && !child.dataset.toolId;
+      var segment = elementSegment(child, segments)
+        ?? (provisional && timeline.segment ? timeline.segment : row.dataset.timelineSegment || '');
+      if (segment === (row.dataset.timelineSegment || '')) continue;
+      var key = JSON.stringify([row.dataset.turnId, segment]);
+      var target = groups.get(key);
+      if (!target) {
+        target = row.cloneNode(false);
+        target.dataset.timelineSegment = segment;
+        groups.set(key, target);
+        rows.push(target);
+      }
+      target.appendChild(child);
+    }
+  }
+  return rows.filter(row => {
+    if (row.children.length) return true;
+    row.remove();
+    return false;
+  });
+}
+
+function isMetadata(message) {
+  return message?.type === 'ai-title'
+    || message?.type === 'custom-title'
+    || message?.type === 'last-prompt';
+}
+
+function changeAffectsDom(change) {
+  var message = change?.after || change?.message || change?.incoming;
+  if (!message || isMetadata(message)) return false;
+  if (message.type === 'user'
+    && typeof message.content === 'string'
+    && /^\s*<subagent_notification>[\s\S]*<\/subagent_notification>\s*$/i
+      .test(message.content)) {
+    return false;
+  }
+  return true;
+}
+
+export function createMessageDom(options) {
+  var state = options.state;
+  var doc = options.document;
+  var rendered = false;
+  var configuredStreamTurnIds = new Set(options.streamTurnIds || []);
+
+  function applyChanges(mergeResult) {
+    var changed = (mergeResult.inserted || []).filter(changeAffectsDom).length
+      + (mergeResult.patched || []).filter(changeAffectsDom).length
+      + (mergeResult.identityUpdated || []).filter(changeAffectsDom).length;
+    if (mergeResult.reordered) changed++;
+    if (mergeResult.authoritative) changed++;
+    if (!changed) return false;
+    var container = doc.querySelector('.messages');
+    if (!container || container.classList.contains('skeleton-messages')) {
+      return false;
+    }
+
+    var olderLoader = container.querySelector(':scope > .loading-older');
+    if (olderLoader) olderLoader.remove();
+    var permissionPrompt = container.querySelector('#permission-prompt');
+    if (permissionPrompt) permissionPrompt.remove();
+    var pendingPlacements = Array.from(container.children)
+      .filter(function (node) {
+        return node.hasAttribute('data-pending');
+      })
+      .map(function (node) {
+        var marker = doc.createElement('span');
+        marker.hidden = true;
+        marker.dataset.pendingPlaceholder = '1';
+        node.before(marker);
+        return { node: node, marker: marker };
+      });
+    var pendingNodes = pendingPlacements.map(function (placement) {
+      return placement.node;
+    });
+    var streamRows = Array.from(container.children).filter(function (node) {
+      return node.classList.contains('stream-preview')
+        || node.classList.contains('stream-committed');
+    });
+    var streamPlacements = new Map();
+    for (var streamNode of streamRows) {
+      var streamMarker = doc.createElement('span');
+      streamMarker.hidden = true;
+      streamMarker.dataset.streamPlaceholder = '1';
+      streamNode.before(streamMarker);
+      streamPlacements.set(streamNode, streamMarker);
+    }
+    for (var node of pendingNodes.concat(streamRows)) node.remove();
+    var streamedTurnIds = new Set(configuredStreamTurnIds);
+    for (var previewTurnId of streamRows.filter(function (node) {
+      return node.classList.contains('stream-preview');
+    }).map(function (node) {
+      return node.dataset?.turnId || '';
+    }).filter(Boolean)) {
+      streamedTurnIds.add(previewTurnId);
+    }
+    var segments = messageSegments(state.wsAllMessages);
+    var streamedSegments = new Map();
+    for (var streamRow of streamRows) {
+      var covered = streamedSegments.get(streamRow.dataset.turnId) || new Set();
+      covered.add(streamRow.dataset.timelineSegment || '');
+      for (var child of Array.from(streamRow.children)) {
+        var childSegment = elementSegment(child, segments);
+        if (childSegment !== undefined) covered.add(childSegment);
+      }
+      streamedSegments.set(streamRow.dataset.turnId, covered);
+    }
+    // After a checkpoint resume the stream renders only post-checkpoint blocks;
+    // earlier messages of the same turn must stay in history.
+    var streamIdentities = new Set();
+    for (var identityRow of streamRows) {
+      for (var identityChild of Array.from(identityRow.children)) {
+        if (identityChild.dataset.messageId) streamIdentities.add('uuid:' + identityChild.dataset.messageId);
+        if (identityChild.dataset.nativeId) streamIdentities.add('native:' + identityChild.dataset.nativeId);
+        if (identityChild.dataset.toolId) streamIdentities.add('tool:' + identityChild.dataset.toolId);
+      }
+    }
+    var renderedByStream = function (message) {
+      if (!options.streamMessageIds || message._strictLifecycle) return true;
+      if (options.streamMessageIds.has(message.nativeId)
+        || options.streamMessageIds.has(message.uuid)
+        || streamIdentities.has('uuid:' + message.uuid)
+        || streamIdentities.has('native:' + message.nativeId)) {
+        return true;
+      }
+      return (Array.isArray(message.content) ? message.content : []).some(function (block) {
+        return block?.type === 'tool_use' && streamIdentities.has('tool:' + block.id);
+      });
+    };
+    var renderMessages = streamedTurnIds.size
+      ? state.wsAllMessages.map(function (message) {
+          var covered = streamedSegments.get(message.turnId);
+          var segment = segments.get('uuid:' + message.uuid)
+            ?? segments.get('native:' + message.nativeId) ?? '';
+          if ((message?.type !== 'assistant' && message?.type !== 'summary')
+            || !streamedTurnIds.has(message.turnId)
+            || (covered && !covered.has(segment))
+            || !renderedByStream(message)) {
+            return message;
+          }
+          return { ...message, _strictManaged: true };
+        })
+      : state.wsAllMessages;
+    var expected = doc.createElement('div');
+    expected.innerHTML = options.renderMessages(
+      renderMessages,
+      options.runtime(),
+      {
+        realtimeOrder: true,
+        pendingTurnIds: pendingNodes.map(node => node.dataset.anchor).filter(Boolean),
+      },
+    );
+    streamRows = splitStreamRows(streamRows, segments, expected);
+    reconcileTopLevel(container, expected);
+    var order = messageOrder(state.wsAllMessages);
+
+    for (var placement of pendingPlacements) {
+      if (placement.marker.isConnected) {
+        placement.marker.replaceWith(placement.node);
+      }
+    }
+    for (var streamRow of streamRows) {
+      for (var recoveredTurn of matchingStreamTurns(
+        container,
+        streamRow,
+      )) {
+        var committed = streamRow.classList.contains('stream-committed');
+        var adopted = new Set();
+        for (var recoveredChild of Array.from(recoveredTurn.children)) {
+          var recoveredKey = domKey(recoveredChild);
+          var toolId = recoveredChild.dataset.toolId || '';
+          var present = Array.from(streamRow.children).find(function (candidate) {
+            return (recoveredKey && domKey(candidate) === recoveredKey)
+              || (toolId && candidate.dataset.toolId === toolId);
+          }) || (committed && Array.from(streamRow.children).find(function (candidate) {
+            // Only a block without identity may stand in for a history node.
+            return !adopted.has(candidate) && !candidate.dataset.messageId
+              && !candidate.dataset.nativeId && !candidate.dataset.toolId
+              && streamChildrenCompatible(candidate, recoveredChild);
+          })) || null;
+          if (present) {
+            adopted.add(present);
+            if (committed && !nodeUnchanged(present, recoveredChild)) {
+              syncElementInPlace(present, recoveredChild);
+            }
+            continue;
+          }
+          var position = elementOrder(recoveredChild, order);
+          // An interrupt ends its turn, even before still-revealing blocks.
+          var before = recoveredChild.classList.contains('msg-interrupt')
+            ? null
+            : Array.from(streamRow.children).find(function (candidate) {
+              return elementOrder(candidate, order) > position;
+            }) || null;
+          streamRow.insertBefore(recoveredChild, before);
+        }
+        recoveredTurn.remove();
+      }
+      var restored = streamRow.dataset.unanchoredTurn === 'true'
+        ? insertByMessageOrder(container, streamRow, order)
+        : attachTimelineTurn(container, streamRow);
+      var streamPlacement = streamPlacements.get(streamRow);
+      if (streamPlacement?.isConnected) {
+        if (restored) streamPlacement.remove();
+        else streamPlacement.replaceWith(streamRow);
+      }
+    }
+    // An interrupted turn can have no stream blocks or durable prompt yet.
+    // Attach its rendered row to the restored optimistic question as well.
+    for (var turnRow of Array.from(container.children)) {
+      if (turnRow.classList.contains('assistant-turn') && turnRow.dataset.turnId
+        && turnRow.querySelector(':scope > .msg-interrupt')) {
+        attachTimelineTurn(container, turnRow);
+      }
+    }
+    if (olderLoader) container.insertBefore(olderLoader, container.firstChild);
+    if (permissionPrompt) container.appendChild(permissionPrompt);
+    state.wsRenderedCount = state.wsAllMessages.length;
+    rendered = true;
+    return true;
+  }
+
+  function finalize() {
+    options.updateTitleFromMessages?.();
+    if (!rendered) return;
+    var container = doc.querySelector('.messages');
+    if (!container) return;
+    options.markTurnAdjacency?.(container);
+    options.loadImages?.(container);
+    options.clampOverflow?.(container);
+    options.renderMermaidBlocks?.(container);
+    options.renderKatexBlocks?.(container);
+  }
+
+  return { applyChanges, finalize };
+}

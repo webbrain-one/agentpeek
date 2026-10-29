@@ -1,17 +1,32 @@
 // Entry for landing.html — single Start URL field for sign-in.
 // A Start URL looks like one of:
-//   https://<server>/?t=<one-time-token>   (issued by install.sh, 60 min single-use)
-//   https://<server>/?key=<apiKey>         (issued by setup page, permanent)
+//   https://<server>/?t=<token>            (install.sh: 12h, Setup: 10 min; reusable until then)
+//   https://<server>/?key=<apiKey>         (older Setup pages)
+import { harmonyBridge, harmonyCall } from './harmony.js';
 import { state } from './state.js';
 import './api.js';
+import { initMacosTabs, setNativeTabTitle } from './macos-tabs.js';
+
+initMacosTabs();
+setNativeTabTitle('Baton');
 
 (function () {
+  function releaseNativeSkeleton() {
+    var nextFrame = window.requestAnimationFrame || function (fn) { setTimeout(fn, 0); };
+    nextFrame(function () {
+      nextFrame(function () {
+        window.__skelReady = 1;
+      });
+    });
+  }
+
   // Tauri/native (non-http origin) lets the QR scanner button show, and we
   // accept Start URLs from any origin. Browser is bound to its own origin.
   var isNativeApp = !location.origin.startsWith('http') || location.origin.includes('tauri.localhost');
   var isMobileApp = isNativeApp && ('ontouchstart' in window || navigator.maxTouchPoints > 0);
+  var harmonyScan = !!harmonyBridge();
 
-  if (isMobileApp) {
+  if (isMobileApp || harmonyScan) {
     var scanBtn = document.getElementById('scanBtn');
     if (scanBtn) scanBtn.style.display = 'flex';
     setupScan();
@@ -28,6 +43,7 @@ import './api.js';
     var prom = urlToken
       ? exchangeToken(browserServer, urlToken).then(function (k) { return routeAfterLogin(k, browserServer); })
       : routeAfterLogin(urlKey, browserServer);
+    releaseNativeSkeleton();
     prom.catch(function (e) {
       hideLoading();
       var errEl = document.getElementById('error');
@@ -43,6 +59,16 @@ import './api.js';
     return;
   }
 
+  releaseNativeSkeleton();
+
+  // iOS keeps the keyboard open on taps that land on non-focusable areas.
+  if ('ontouchstart' in window || navigator.maxTouchPoints > 0) {
+    document.addEventListener('pointerdown', function (event) {
+      var active = document.activeElement;
+      if (active?.matches('input') && !event.target.closest('input, button, a, label')) active.blur();
+    }, true);
+  }
+
   async function doConnect() {
     var input = document.getElementById('startUrlInput');
     var raw = (input.value || '').trim();
@@ -50,7 +76,7 @@ import './api.js';
     var btn = document.getElementById('connectBtn');
 
     if (!raw) {
-      errEl.textContent = 'Please enter your AgentPeek Start URL';
+      errEl.textContent = 'Please enter your Baton Start URL';
       errEl.style.display = 'block';
       return;
     }
@@ -100,6 +126,17 @@ import './api.js';
   function setupScan() {
     var scanBtn = document.getElementById('scanBtn');
     if (!scanBtn) return;
+    if (harmonyScan) { setupHarmonyScan(scanBtn); return; }
+    // Android Back cancels a scan, otherwise backgrounds the app. Tauri keeps
+    // listeners across page loads, so this page registers its own.
+    if (window.BatonAndroid) {
+      import('@tauri-apps/api/app').then(function (appMod) {
+        return appMod.onBackButtonPress(function () {
+          if (scanModule) window.__cancelScan();
+          else window.BatonAndroid.moveTaskToBack();
+        });
+      }).catch(function () {});
+    }
     scanBtn.addEventListener('click', async function () {
       var errEl = document.getElementById('error');
       errEl.style.display = 'none';
@@ -117,14 +154,8 @@ import './api.js';
           }
         }
         // windowed:false → camera fully covers the webview. iOS: native × button
-        // injected by main.mm. Android: system back button cancels via onBackButtonPress.
-        var backListener = null;
-        try {
-          var appMod = await import('@tauri-apps/api/app');
-          backListener = await appMod.onBackButtonPress(function () { window.__cancelScan(); });
-        } catch (_) {}
+        // injected by main.mm. Android: the system Back listener above cancels.
         var result = await mod.scan({ windowed: false, formats: [mod.Format.QRCode] });
-        if (backListener) backListener.unregister();
         scanModule = null;
         var content = (result && result.content) ? String(result.content).trim() : '';
         if (!content) return;
@@ -136,7 +167,6 @@ import './api.js';
           errEl.style.display = 'block';
         });
       } catch (e) {
-        if (backListener) backListener.unregister();
         scanModule = null;
         var msg = (e && e.message) ? String(e.message) : '';
         if (/cancel/i.test(msg)) return;
@@ -146,12 +176,38 @@ import './api.js';
     });
   }
 
+  // ScanKit's own UI handles the camera, permission and cancel; a cancel or
+  // failure stays silent so the user can retry or paste the Start URL.
+  function setupHarmonyScan(scanBtn) {
+    scanBtn.addEventListener('click', function () {
+      document.getElementById('error').style.display = 'none';
+      harmonyCall('scan').then(handleScannedContent, hideLoading);
+    });
+  }
+
+  // Shared by the HarmonyOS scan path: fill the input and run the login flow.
+  async function handleScannedContent(content) {
+    var c = (content || '').trim();
+    if (!c) return;
+    var errEl = document.getElementById('error');
+    document.getElementById('startUrlInput').value = c;
+    showLoading('Connecting');
+    try {
+      await applyStartUrl(c);
+    } catch (e) {
+      hideLoading();
+      errEl.textContent = errorMessage(e);
+      errEl.style.display = 'block';
+    }
+  }
+
   // Called by the native × button on the camera view. Guard against double-tap.
   window.__cancelScan = function () {
     if (cancelInFlight) return;
     if (!scanModule || typeof scanModule.cancel !== 'function') return;
     cancelInFlight = true;
-    scanModule.cancel().catch(function () {}).finally(function () { cancelInFlight = false; });
+    // Android's cancel never settles the pending scan(), so clear the scan state here.
+    scanModule.cancel().catch(function () {}).finally(function () { cancelInFlight = false; scanModule = null; });
   };
 
   async function exchangeToken(server, token) {
@@ -162,7 +218,7 @@ import './api.js';
       body: JSON.stringify({ token: token }),
     });
     if (!res.ok) {
-      throw new Error(res.status === 401 ? 'Link expired or already used. Re-run deploy to get a new link.' : 'Connection failed');
+      throw new Error(res.status === 401 ? 'Link expired. Get a new one from Setup or re-run deploy.' : 'Connection failed');
     }
     var data = await res.json();
     if (!data || !data.apiKey) throw new Error('Invalid response');

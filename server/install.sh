@@ -1,13 +1,14 @@
 #!/bin/bash
-# AgentPeek Server — one-command deploy
+# Baton Server — one-command deploy
 #
 # Usage:
-#   curl -fsSL https://raw.githubusercontent.com/zhu-xiaowei/agentpeek/main/server/install.sh | bash
+#   curl -fsSL https://raw.githubusercontent.com/zhu-xiaowei/baton/main/server/install.sh | bash
 #   curl ... | bash -s -- --region us-west-2
 #   ./install.sh                                 # from cloned repo
 #   ./install.sh --region us-west-2
 #   ./install.sh --region us-west-2 --stack MyStack
 #   ./install.sh --region us-west-2 --profile myprofile
+#   ./install.sh --rotate-key                    # replace the API key; every device signs in again
 
 main() {
 set -euo pipefail
@@ -24,8 +25,8 @@ LINE="=================================================================="
 trap 'rc=$?; echo ""; echo "${C_RED}ERROR: install.sh failed at line $LINENO (exit $rc): $BASH_COMMAND${C_RESET}" >&2; exit $rc' ERR
 
 # ===== Self-bootstrap: if not inside the repo, clone it first =====
-REPO_URL="https://github.com/zhu-xiaowei/agentpeek.git"
-SELF_MARKER="server/template/AgentPeek.template"
+REPO_URL="https://github.com/zhu-xiaowei/baton.git"
+SELF_MARKER="server/template/Baton.template"
 
 if [ ! -f "$(dirname "${BASH_SOURCE[0]:-$0}")/../$SELF_MARKER" ] 2>/dev/null; then
   if ! command -v git >/dev/null 2>&1; then
@@ -45,13 +46,13 @@ if [ ! -f "$(dirname "${BASH_SOURCE[0]:-$0}")/../$SELF_MARKER" ] 2>/dev/null; th
 
   CLONE_DIR=$(mktemp -d)
   trap 'rm -rf "$CLONE_DIR"' EXIT
-  echo "Cloning agentpeek..."
-  if ! git clone --depth 1 --quiet "$REPO_URL" "$CLONE_DIR/agentpeek"; then
+  echo "Cloning baton..."
+  if ! git clone --depth 1 --quiet "$REPO_URL" "$CLONE_DIR/baton"; then
     echo "${C_RED}ERROR: Failed to clone repository${C_RESET}"
     exit 1
   fi
   set +e
-  bash "$CLONE_DIR/agentpeek/server/install.sh" "$@"
+  bash "$CLONE_DIR/baton/server/install.sh" "$@"
   exit $?
 fi
 
@@ -128,14 +129,16 @@ wait_stack() {
 
 # ===== Parse args =====
 REGION=""
-STACK_NAME="AgentPeek"
+STACK_NAME="Baton"
 PROFILE=""
-REPO_NAME="agentpeek-api"
+REPO_NAME="baton-api"
 TAG="latest"
+ROTATE_KEY=false
 
 while [[ $# -gt 0 ]]; do
   case $1 in
     --region)  REGION="$2"; shift 2 ;;
+    --rotate-key) ROTATE_KEY=true; shift ;;
     --stack)   STACK_NAME="$2"; shift 2 ;;
     --profile) PROFILE="$2"; shift 2 ;;
     *) echo "Unknown arg: $1"; exit 1 ;;
@@ -168,11 +171,11 @@ STS_OUT=$(aws sts get-caller-identity --region "$REGION" --output text --query A
 }
 ACCOUNT_ID="$STS_OUT"
 
-echo "Deploying AgentPeek — region=$REGION, stack=$STACK_NAME, account=$ACCOUNT_ID"
+echo "Deploying Baton — region=$REGION, stack=$STACK_NAME, account=$ACCOUNT_ID"
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 SRC_DIR="$SCRIPT_DIR/src"
-TEMPLATE="$SCRIPT_DIR/template/AgentPeek.template"
+TEMPLATE="$SCRIPT_DIR/template/Baton.template"
 WEB_DIR="$SCRIPT_DIR/../web"
 ROOT_DIR="$SCRIPT_DIR/.."
 REPO_URI="${ACCOUNT_ID}.dkr.ecr.${REGION}.amazonaws.com/${REPO_NAME}"
@@ -183,17 +186,34 @@ CODEBUILD_ROLE="${STACK_NAME}-codebuild-role"
 # Ensure S3 bucket exists (shared for build artifacts, bridge package, images)
 aws s3 mb "s3://${S3_BUCKET}" --region "$REGION" >/dev/null 2>&1 || true
 
-# App version: semantic from package.json + short git hash (e.g. "0.2.0-92144c3").
+aws s3api put-bucket-cors --bucket "$S3_BUCKET" --region "$REGION" --cors-configuration \
+  '{"CORSRules":[{"AllowedOrigins":["*"],"AllowedMethods":["GET","PUT","HEAD"],"AllowedHeaders":["*"],"ExposeHeaders":["ETag","Content-Length","Content-Type"],"MaxAgeSeconds":3600}]}'
+UPLOAD_ACCELERATION=false
+if [ "${S3_UPLOAD_ACCELERATE:-true}" = "true" ]; then
+  echo "Enabling S3 upload acceleration (AWS transfer acceleration charges may apply)..."
+  if aws s3api put-bucket-accelerate-configuration --bucket "$S3_BUCKET" --region "$REGION" \
+      --accelerate-configuration Status=Enabled; then
+    UPLOAD_ACCELERATION=true
+  else
+    echo "S3 acceleration unavailable; using standard S3 direct uploads."
+  fi
+fi
+
+# App version: semantic from package.json + short git hash (e.g. "1.0.0-92144c3").
 # Git hash auto-bumps every commit — bridge auto-update triggers on each redeploy.
 SEMANTIC=$(sed -n 's/.*"version"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$ROOT_DIR/package.json" | head -1)
 SEMANTIC="${SEMANTIC:-dev}"
 GIT_HASH=$(git -C "$ROOT_DIR" rev-parse --short HEAD 2>/dev/null || echo "")
-if [ -n "$GIT_HASH" ]; then
+if [ -n "${APP_VERSION_OVERRIDE:-}" ]; then
+  APP_VERSION="$APP_VERSION_OVERRIDE"
+elif [ -n "$GIT_HASH" ]; then
   APP_VERSION="${SEMANTIC}-${GIT_HASH}"
 else
   APP_VERSION="$SEMANTIC"
 fi
 
+# --rotate-key keeps the deployed image, Bridge package and template; it only replaces the key.
+if [ "$ROTATE_KEY" != true ]; then
 # ===== Step 1: Build server Docker image =====
 echo "[1/4] Building server Docker image (version=$APP_VERSION)..."
 
@@ -205,10 +225,16 @@ trap 'rm -rf "$BUILD_CTX"' EXIT
 cp -r "$SRC_DIR"/. "$BUILD_CTX/"
 rm -f "$BUILD_CTX/test_api.py" 2>/dev/null || true
 cp -r "$WEB_DIR" "$BUILD_CTX/web"
+mkdir -p "$BUILD_CTX/bridge"
+cp "$ROOT_DIR/bridge/terminal-direct-protocol.mjs" \
+  "$ROOT_DIR/bridge/preview-protocol.mjs" \
+  "$ROOT_DIR/bridge/realtime-direct-protocol.mjs" \
+  "$ROOT_DIR/bridge/tool-preview.mjs" \
+  "$ROOT_DIR/bridge/live-turn-stream.mjs" "$BUILD_CTX/bridge/"
 rm -f "$BUILD_CTX/web/test_api.py" 2>/dev/null || true
 cp "$ROOT_DIR/package.json" "$ROOT_DIR/package-lock.json" "$ROOT_DIR/vite.config.js" "$BUILD_CTX/"
 
-SRC_ZIP="/tmp/agentpeek-src-$$.zip"
+SRC_ZIP="/tmp/baton-src-$$.zip"
 (cd "$BUILD_CTX" && zip -qr "$SRC_ZIP" .)
 aws s3 cp "$SRC_ZIP" "s3://${S3_BUCKET}/build/src.zip" --region "$REGION" --only-show-errors
 rm -f "$SRC_ZIP"
@@ -360,19 +386,51 @@ if [ "$STATUS" != "SUCCEEDED" ]; then
   exit 1
 fi
 
-# ===== Step 2: Deploy CloudFormation =====
-echo "[2/4] Deploying CloudFormation stack..."
+# Publish the immutable Bridge package before exposing its version through
+# CloudFormation. If deployment stops here, existing Bridges still see the old
+# server version and do not download a mismatched package.
+echo "[2/4] Uploading bridge package..."
+BRIDGE_DIR="$ROOT_DIR/bridge"
+BRIDGE_TAR="/tmp/baton-bridge.tar.gz"
+BRIDGE_STAGE=$(mktemp -d)
+cp "$BRIDGE_DIR"/*.mjs "$BRIDGE_DIR/package.json" "$BRIDGE_DIR/package-lock.json" "$BRIDGE_STAGE/"
+cp -R "$BRIDGE_DIR/project" "$BRIDGE_STAGE/project"
+# One-release compatibility for older Bridge updaters that only install root *.mjs.
+sed \
+  -e "s#from '../#from './#g" \
+  -e "s#from './ws-frames.mjs'#from './project/ws-frames.mjs'#g" \
+  "$BRIDGE_DIR/project/files.mjs" > "$BRIDGE_STAGE/project-files.mjs"
+printf "// Generated by server/install.sh\\nexport const BRIDGE_VERSION = '%s';\\n" "$APP_VERSION" > "$BRIDGE_STAGE/version.mjs"
+(cd "$BRIDGE_STAGE" && tar czf "$BRIDGE_TAR" *.mjs project package.json package-lock.json)
+aws s3 cp "$BRIDGE_TAR" "s3://${S3_BUCKET}/install/bridge.tar.gz" --region "$REGION" --only-show-errors
+rm -rf "$BRIDGE_TAR" "$BRIDGE_STAGE"
+
+WS_ZIP=$(mktemp -t baton-ws-lambda.XXXX)
+rm -f "$WS_ZIP"
+WS_ZIP="$WS_ZIP.zip"
+WS_CODE_KEY="deploy/ws/${APP_VERSION}-$(date +%s)-$$.zip"
+(cd "$SRC_DIR" && zip -qr "$WS_ZIP" api_key.py bridge_ws.py message_history.py terminal_ws.py terminal_direct_ws.py preview_tunnel_ws.py realtime_direct_ws.py project -x '*/__pycache__/*' '*.pyc')
+aws s3 cp "$WS_ZIP" "s3://${S3_BUCKET}/${WS_CODE_KEY}" --region "$REGION" --only-show-errors
+rm -f "$WS_ZIP"
+fi
+
+# ===== Step 3: Deploy CloudFormation =====
+echo "[3/4] Deploying CloudFormation stack..."
 # Use image digest (immutable) so CFN detects parameter changes and updates the
 # Lambda function automatically. With a mutable :tag the parameter string never
 # changes between deploys and CFN treats the Lambda as unchanged, leaving it
 # pinned to the previous image digest.
-IMAGE_DIGEST=$(aws ecr describe-images --repository-name "$REPO_NAME" --region "$REGION" \
-  --image-ids "imageTag=$TAG" --query 'imageDetails[0].imageDigest' --output text 2>/dev/null)
-if [ -z "$IMAGE_DIGEST" ] || [ "$IMAGE_DIGEST" = "None" ]; then
-  echo "${C_RED}ERROR: Failed to resolve image digest for ${REPO_NAME}:${TAG}${C_RESET}" >&2
-  exit 1
-fi
-IMAGE_URI="${REPO_URI}@${IMAGE_DIGEST}"
+image_uri() {
+  local digest
+  digest=$(aws ecr describe-images --repository-name "$REPO_NAME" --region "$REGION" \
+    --image-ids "imageTag=$1" --query 'imageDetails[0].imageDigest' --output text 2>/dev/null)
+  if [ -z "$digest" ] || [ "$digest" = "None" ]; then
+    echo "${C_RED}ERROR: Failed to resolve image digest for ${REPO_NAME}:$1${C_RESET}" >&2
+    exit 1
+  fi
+  echo "${REPO_URI}@${digest}"
+}
+[ "$ROTATE_KEY" = true ] || IMAGE_URI=$(image_uri "$TAG") || exit 1
 
 cfn_dump_failure() {
   echo ""
@@ -386,45 +444,88 @@ cfn_dump_failure() {
 STACK_STATUS=$(aws cloudformation describe-stacks --stack-name "$STACK_NAME" --region "$REGION" \
   --query 'Stacks[0].StackStatus' --output text 2>/dev/null || echo "DOES_NOT_EXIST")
 
+stack_param() {
+  aws cloudformation describe-stacks --stack-name "$STACK_NAME" --region "$REGION" \
+    --query "Stacks[0].Parameters[?ParameterKey=='$1'].ParameterValue | [0]" --output text 2>/dev/null || echo ""
+}
+api_key_value() {
+  local key_id
+  key_id=$(aws cloudformation describe-stacks --stack-name "$STACK_NAME" --region "$REGION" \
+    --query 'Stacks[0].Outputs[?OutputKey==`ApiKeyId`].OutputValue' --output text 2>/dev/null || echo "")
+  if [ -z "$key_id" ] || [ "$key_id" = "None" ]; then
+    key_id=$(aws apigateway get-api-keys --region "$REGION" \
+      --query "items[?name=='${STACK_NAME}-api-key'].id | [0]" --output text)
+  fi
+  aws apigateway get-api-key --api-key "$key_id" --include-value --region "$REGION" \
+    --query 'value' --output text
+}
+# Data is keyed by an account ID that was originally SHA256(key)[:16]. Pin it before the key can
+# change, so a rotated key keeps the same data. A new stack derives it from its first key.
+DATA_ACCOUNT_ID=""
+KEY_NAME="${STACK_NAME}-api-key"
+if [ "$STACK_STATUS" != "DOES_NOT_EXIST" ]; then
+  DATA_ACCOUNT_ID=$(stack_param AccountId)
+  if [ -z "$DATA_ACCOUNT_ID" ] || [ "$DATA_ACCOUNT_ID" = "None" ]; then
+    # A wrong ID would be pinned for good, so a failed key lookup must stop the deploy.
+    CURRENT_KEY=$(api_key_value) || CURRENT_KEY=""
+    if [ -z "$CURRENT_KEY" ] || [ "$CURRENT_KEY" = "None" ]; then
+      echo "${C_RED}ERROR: could not read the current API key to pin the account ID${C_RESET}" >&2
+      exit 1
+    fi
+    DATA_ACCOUNT_ID=$(printf '%s' "$CURRENT_KEY" | openssl dgst -sha256 | awk '{print substr($NF, 1, 16)}')
+  fi
+  PREVIOUS_KEY_NAME=$(stack_param ApiKeyName)
+  if [ -n "$PREVIOUS_KEY_NAME" ] && [ "$PREVIOUS_KEY_NAME" != "None" ]; then KEY_NAME="$PREVIOUS_KEY_NAME"; fi
+fi
+if [ "$ROTATE_KEY" = true ]; then
+  if [ "$STACK_STATUS" = "DOES_NOT_EXIST" ] || [ -z "${PREVIOUS_KEY_NAME:-}" ] || [ "$PREVIOUS_KEY_NAME" = "None" ]; then
+    echo "${C_RED}ERROR: --rotate-key needs a stack deployed with this version; run install.sh once first${C_RESET}" >&2
+    exit 1
+  fi
+  # A new name makes CloudFormation replace the key with a newly generated value.
+  KEY_NAME="${STACK_NAME}-api-key-$(date +%Y%m%d%H%M%S)"
+  echo "  ${C_DIM}Rotating the API key: every device must sign in again with the new Start URL${C_RESET}"
+fi
+
+if [ "$ROTATE_KEY" = true ]; then
+  TEMPLATE_ARGS=(--use-previous-template)
+  STACK_PARAMS=()
+  for key in ContainerImageUri ImagesBucketName FileUploadAcceleration WsCodeS3Key AppVersion; do
+    STACK_PARAMS+=("ParameterKey=$key,UsePreviousValue=true")
+  done
+else
+  TEMPLATE_ARGS=(--template-body "file://$TEMPLATE")
+  STACK_PARAMS=(
+    "ParameterKey=ContainerImageUri,ParameterValue=$IMAGE_URI"
+    "ParameterKey=ImagesBucketName,ParameterValue=$S3_BUCKET"
+    "ParameterKey=FileUploadAcceleration,ParameterValue=$UPLOAD_ACCELERATION"
+    "ParameterKey=WsCodeS3Key,ParameterValue=$WS_CODE_KEY"
+    "ParameterKey=AppVersion,ParameterValue=$APP_VERSION"
+  )
+fi
+STACK_PARAMS+=(
+  "ParameterKey=AccountId,ParameterValue=$DATA_ACCOUNT_ID"
+  "ParameterKey=ApiKeyName,ParameterValue=$KEY_NAME"
+)
+
 if [ "$STACK_STATUS" = "DOES_NOT_EXIST" ]; then
   aws cloudformation create-stack \
     --stack-name "$STACK_NAME" --region "$REGION" \
-    --template-body "file://$TEMPLATE" \
-    --parameters \
-      "ParameterKey=ContainerImageUri,ParameterValue=$IMAGE_URI" \
-      "ParameterKey=ImagesBucketName,ParameterValue=$S3_BUCKET" \
-      "ParameterKey=AppVersion,ParameterValue=$APP_VERSION" \
-    --capabilities CAPABILITY_IAM >/dev/null
+    "${TEMPLATE_ARGS[@]}" --parameters "${STACK_PARAMS[@]}" \
+    --capabilities CAPABILITY_NAMED_IAM >/dev/null
   wait_stack "CREATE_COMPLETE" || cfn_dump_failure
 else
-  if aws cloudformation update-stack \
+  if UPDATE_RESULT=$(aws cloudformation update-stack \
        --stack-name "$STACK_NAME" --region "$REGION" \
-       --template-body "file://$TEMPLATE" \
-       --parameters \
-         "ParameterKey=ContainerImageUri,ParameterValue=$IMAGE_URI" \
-         "ParameterKey=ImagesBucketName,ParameterValue=$S3_BUCKET" \
-         "ParameterKey=AppVersion,ParameterValue=$APP_VERSION" \
-       --capabilities CAPABILITY_IAM >/dev/null 2>&1; then
+       "${TEMPLATE_ARGS[@]}" --parameters "${STACK_PARAMS[@]}" \
+       --capabilities CAPABILITY_NAMED_IAM 2>&1); then
     wait_stack "UPDATE_COMPLETE" || cfn_dump_failure
+  elif ! printf '%s' "$UPDATE_RESULT" | grep -q 'No updates are to be performed'; then
+    printf '%s\n' "$UPDATE_RESULT" >&2
+    exit 1
   fi
 fi
 echo "  ${C_GREEN}✓${C_RESET} Stack ready"
-
-# Update WS Lambda code (standalone Python zip — CFN template stores a placeholder
-# so the real handler is pushed out-of-band each deploy).
-WS_FUNC="${STACK_NAME}-ws-handler"
-WS_ZIP="/tmp/agentpeek-ws-lambda.zip"
-(cd "$SRC_DIR" && zip -q "$WS_ZIP" bridge_ws.py)
-aws lambda update-function-code --function-name "$WS_FUNC" --zip-file "fileb://$WS_ZIP" --region "$REGION" >/dev/null 2>&1 || true
-rm -f "$WS_ZIP"
-
-# ===== Step 3: Upload bridge install package =====
-echo "[3/4] Uploading bridge package..."
-BRIDGE_DIR="$ROOT_DIR/bridge"
-BRIDGE_TAR="/tmp/agentpeek-bridge.tar.gz"
-(cd "$BRIDGE_DIR" && tar czf "$BRIDGE_TAR" *.mjs package.json)
-aws s3 cp "$BRIDGE_TAR" "s3://${S3_BUCKET}/install/bridge.tar.gz" --region "$REGION" --only-show-errors
-rm -f "$BRIDGE_TAR"
 
 # ===== Step 4: Fetch outputs =====
 echo "[4/4] Fetching outputs..."
@@ -435,29 +536,21 @@ API_URL=$(aws cloudformation describe-stacks --stack-name "$STACK_NAME" --region
 CF_URL=$(aws cloudformation describe-stacks --stack-name "$STACK_NAME" --region "$REGION" \
   --query 'Stacks[0].Outputs[?OutputKey==`CloudFrontURL`].OutputValue' --output text 2>/dev/null || echo "")
 
-KEY_ID=$(aws cloudformation describe-stacks --stack-name "$STACK_NAME" --region "$REGION" \
-  --query 'Stacks[0].Outputs[?OutputKey==`ApiKeyId`].OutputValue' --output text 2>/dev/null || echo "")
-if [ -z "$KEY_ID" ] || [ "$KEY_ID" = "None" ]; then
-  KEY_ID=$(aws apigateway get-api-keys --region "$REGION" \
-    --query "items[?name=='${STACK_NAME}-api-key'].id | [0]" --output text)
-fi
-API_KEY=$(aws apigateway get-api-key --api-key "$KEY_ID" --include-value --region "$REGION" \
-  --query 'value' --output text)
-
 if [ -n "$CF_URL" ] && [ "$CF_URL" != "None" ]; then
   BASE_URL="$CF_URL"
 else
   BASE_URL="$API_URL"
 fi
 
-# Generate token (12h TTL) — exchanged on first page load for the real API key.
-# Lets us print a single URL without exposing the key in console / shell history.
+# Generate token (12h TTL, reusable until then) — exchanged on page load for the API key.
+# Lets us print a single URL without exposing the key in console / shell history. The token
+# names the key instead of holding it, so rotating the key retires it.
 SYSTEM_TABLE="${STACK_NAME}-system"
 TOKEN=$(openssl rand -hex 16)
 TOKEN_TTL=$(($(date +%s) + 43200))
 aws dynamodb put-item \
   --table-name "$SYSTEM_TABLE" --region "$REGION" \
-  --item "{\"pk\":{\"S\":\"TOKEN\"},\"sk\":{\"S\":\"$TOKEN\"},\"apiKey\":{\"S\":\"$API_KEY\"},\"ttl\":{\"N\":\"$TOKEN_TTL\"}}" \
+  --item "{\"pk\":{\"S\":\"TOKEN\"},\"sk\":{\"S\":\"$TOKEN\"},\"keyName\":{\"S\":\"$KEY_NAME\"},\"ttl\":{\"N\":\"$TOKEN_TTL\"}}" \
   >/dev/null
 
 OPEN_URL="${BASE_URL}/?t=${TOKEN}"
@@ -467,7 +560,7 @@ echo "${C_GREEN}${LINE}${C_RESET}"
 echo "${C_GREEN}${C_BOLD}  ✓ Deploy successful!${C_RESET}"
 echo "${C_GREEN}${LINE}${C_RESET}"
 echo ""
-echo "  ${C_BOLD}AgentPeek Start URL${C_RESET} ${C_DIM}(expires in 12 hours)${C_RESET}"
+echo "  ${C_BOLD}Baton Start URL${C_RESET} ${C_DIM}(expires in 12 hours)${C_RESET}"
 echo ""
 echo "  ${C_BOLD}${OPEN_URL}${C_RESET}"
 echo ""
@@ -475,7 +568,7 @@ echo "${C_GREEN}${LINE}${C_RESET}"
 
 # Print scannable QR if Node.js is available (non-fatal if not)
 if command -v node >/dev/null 2>&1 && command -v npm >/dev/null 2>&1; then
-  QR_CACHE="$HOME/.cache/agentpeek-qr"
+  QR_CACHE="$HOME/.cache/baton-qr"
   echo ""
   echo "  ${C_BOLD}Or scan to open on phone:${C_RESET}"
   (

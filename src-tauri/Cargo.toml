@@ -1,7 +1,7 @@
 [package]
-name = "agentpeek"
-version = "0.2.0"
-description = "AgentPeek - Monitor Claude Code sessions from anywhere"
+name = "baton"
+version = "1.0.0"
+description = "Baton - Monitor and control local agent sessions from anywhere"
 authors = ["xiaoweii"]
 edition = "2021"
 rust-version = "1.77.2"
@@ -13,14 +13,38 @@ crate-type = ["staticlib", "cdylib", "rlib"]
 [build-dependencies]
 tauri-build = { version = "2.6.1", features = [] }
 
+# Shrink the release binary → faster dyld load → faster iOS cold start (pre-main).
+[profile.release]
+opt-level = "s"    # optimize for size
+lto = true         # link-time optimization, meaningfully smaller
+codegen-units = 1  # better cross-unit optimization (slower build)
+strip = true       # drop symbol table
+panic = "abort"    # drop unwind tables
+
 [dependencies]
+base64 = "0.22"
 serde_json = "1.0"
 serde = { version = "1.0", features = ["derive"] }
 log = "0.4"
-tauri = { version = "2.11.1", features = [] }
+tauri = { version = "2.11.1", features = ["macos-private-api"] }
+uuid = { version = "1", features = ["v4"] }
 tauri-plugin-log = "2"
 tauri-plugin-opener = "2"
+tauri-plugin-in-app-browser = "1.0.1"
+tauri-plugin-file-download = { path = "plugins/tauri-plugin-file-download" }
+tauri-plugin-preview-webview = { path = "plugins/tauri-plugin-preview-webview" }
 
 [target."cfg(any(target_os = \"android\", target_os = \"ios\"))".dependencies]
 tauri-plugin-barcode-scanner = "2"
+tauri-plugin-clipboard-manager = "2"
 tauri-plugin-speech = { path = "plugins/tauri-plugin-speech" }
+
+[target."cfg(target_os = \"ios\")".dependencies]
+objc2-foundation = { version = "0.3", default-features = false, features = ["std", "NSBundle", "NSString"] }
+
+[target."cfg(target_os = \"macos\")".dependencies]
+# Multiple webviews per window (tab strip + one webview per tab) are macOS-only.
+tauri = { version = "2.11.1", features = ["unstable"] }
+objc2-app-kit = { version = "0.3", default-features = false, features = ["std", "NSView", "NSResponder", "NSWindow"] }
+objc2-foundation = { version = "0.3", default-features = false, features = ["std", "NSProcessInfo", "NSGeometry"] }
+objc2 = "0.6"

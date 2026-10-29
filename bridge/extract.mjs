@@ -2,8 +2,9 @@ import fs from 'fs';
 import path from 'path';
 import crypto from 'crypto';
 import sharp from 'sharp';
-import { post } from './http.mjs';
+import { post, postRequired } from './http.mjs';
 import { VALID_TYPES, MAX_POST_BYTES, DDB_ITEM_LIMIT, BRIDGE_HOME } from './config.mjs';
+import { stripToolResultBase64, toolPreview, toolPreviews } from './tool-preview.mjs';
 
 // Track sync position: sessionId → line number (the watcher's per-session read watermark).
 export const synced = new Map();
@@ -12,16 +13,38 @@ export const synced = new Map();
 // reading from line 0 (which re-pushes whole histories). Runtime keeps the Map hot; we
 // only flush on exit + a low-frequency interval (crash fallback), never per-set.
 const SYNCED_PATH = path.join(BRIDGE_HOME, 'synced.json');
+export function decodeSyncedState(value) {
+  const version = value?.version;
+  const source = version === 2 && value?.watermarks && typeof value.watermarks === 'object'
+    ? value.watermarks
+    : value;
+  const result = new Map();
+  if (!source || typeof source !== 'object') return result;
+  for (const [key, raw] of Object.entries(source)) {
+    if (typeof raw !== 'number') continue;
+    // Replay one legacy Claude line to avoid the old trailing-newline offset.
+    const line = version === 2 || key.startsWith('codex:') ? raw : Math.max(0, raw - 1);
+    result.set(key, line);
+  }
+  return result;
+}
+
 export function loadSynced() {
   try {
-    const obj = JSON.parse(fs.readFileSync(SYNCED_PATH, 'utf-8'));
-    for (const k in obj) if (typeof obj[k] === 'number') synced.set(k, obj[k]);
+    const saved = JSON.parse(fs.readFileSync(SYNCED_PATH, 'utf-8'));
+    if (saved.historyVersion !== 2) return;
+    const restored = decodeSyncedState(saved);
+    for (const [key, line] of restored) synced.set(key, line);
     console.log(`[synced] restored ${synced.size} session watermarks`);
   } catch {} // missing/corrupt → start empty (handleHeadlessSend baselines on demand)
 }
 export function saveSynced() {
   try {
-    fs.writeFileSync(SYNCED_PATH, JSON.stringify(Object.fromEntries(synced)));
+    fs.writeFileSync(SYNCED_PATH, JSON.stringify({
+      version: 2,
+      historyVersion: 2,
+      watermarks: Object.fromEntries(synced),
+    }));
   } catch {}
 }
 // jsonl line count matching the watcher's convention (drop a single trailing empty line).
@@ -52,12 +75,11 @@ function collectStrings(node, out) {
 }
 
 // Return a structural clone of `msg` whose JSON byte size is <= maxBytes,
-// preserving as much of each string's prefix as possible. Repeatedly trims the
-// currently-longest string field (keeping its head + a truncation marker) until
-// the whole message fits. Returns the message unchanged if already within limit.
+// preserving tool previews before applying the transport's hard limit.
 export function truncateToBytes(msg, maxBytes) {
   if (Buffer.byteLength(JSON.stringify(msg)) <= maxBytes) return msg;
-  const clone = JSON.parse(JSON.stringify(msg));
+  const clone = structuredClone(toolPreview(msg));
+  if (Buffer.byteLength(JSON.stringify(clone)) <= maxBytes) return clone;
   const fields = [];
   collectStrings(clone, fields);
   // Trim longest-first; loop until it fits or no further reduction is possible.
@@ -96,23 +118,8 @@ async function processImage(base64Data) {
   return key;
 }
 
-// Drop image base64 from a tool_result block's nested content (app renders via S3 key).
-function stripToolResultBase64(block) {
-  if (!Array.isArray(block.content)) return block;
-  const content = block.content.map((c) =>
-    c.type === 'image' && c.source?.data ? { ...c, source: { ...c.source, data: '' } } : c);
-  return { ...block, content };
-}
-
-// Drop the big base64 payload from a toolUseResult (image/file), keep metadata.
-function stripToolUseResultBase64(tur) {
-  if (tur && tur.file && tur.file.base64) {
-    return { ...tur, file: { ...tur.file, base64: '' } };
-  }
-  return tur;
-}
-
 export async function extractForApp(msg) {
+  msg = normalizeClaudeQueuedInput(msg);
   if (msg.type === 'ai-title' || msg.type === 'custom-title' || msg.type === 'last-prompt') {
     const content = msg.aiTitle || msg.customTitle || msg.lastPrompt || '';
     // Content-addressed uuid so re-syncing overwrites one DDB item instead of accumulating (was Date.now()).
@@ -163,28 +170,66 @@ export async function extractForApp(msg) {
   };
   // jsonl uses camelCase toolUseResult; headless stream uses snake_case — accept either.
   const tur = msg.toolUseResult ?? msg.tool_use_result;
-  if (tur) extracted.toolUseResult = stripToolUseResultBase64(tur);
+  if (tur) extracted.toolUseResult = tur.file?.base64
+    ? { ...tur, file: { ...tur.file, base64: '' } }
+    : tur;
   if (msg.message?.stop_reason) extracted.stopReason = msg.message.stop_reason;
   return extracted;
 }
 
-export async function readNewMessages(filePath, sessionId) {
-  if (!fs.existsSync(filePath)) return [];
+export function normalizeClaudeQueuedInput(message) {
+  // Render system local_command output like the older <local-command-stdout> user row.
+  if (message?.type === 'system' && message.subtype === 'local_command'
+    && /^<local-command-stdout>/.test(message.content || '')) {
+    return { ...message, type: 'user', message: { role: 'user', content: message.content } };
+  }
+  const attachment = message?.attachment;
+  if (message?.type !== 'attachment' || attachment?.type !== 'queued_command'
+    || !attachment.source_uuid) return message;
+  return {
+    ...message,
+    type: 'user',
+    uuid: attachment.source_uuid,
+    message: { role: 'user', content: attachment.prompt ?? '' },
+  };
+}
+
+export function nativeOrderKey(line, fragment = 0) {
+  return `O2#${String(line).padStart(12, '0')}#${String(fragment).padStart(4, '0')}`;
+}
+
+export function isClaudeLocalCommandCaveat(msg) {
+  const content = msg?.message?.content;
+  return msg?.type === 'user'
+    && msg.isMeta === true
+    && typeof content === 'string'
+    && content.trimStart().startsWith('<local-command-caveat>');
+}
+
+export async function extractClaudeMessages(filePath, sessionId, options = {}) {
+  const watermarks = options.watermarks || synced;
+  const startLine = options.startLine ?? watermarks.get(sessionId) ?? 0;
+  if (!fs.existsSync(filePath)) return { messages: [], nextLine: startLine };
   const lines = fs.readFileSync(filePath, 'utf-8').split('\n');
-  const lastLine = synced.get(sessionId) ?? 0;
+  if (lines.at(-1) === '') lines.pop();
   const newMsgs = [];
   const metaUuids = new Set();
   const metaIdx = {}; // type → index in newMsgs (keep only latest per type)
 
-  for (let i = lastLine; i < lines.length; i++) {
+  for (let i = Math.min(startLine, lines.length); i < lines.length; i++) {
     if (!lines[i].trim()) continue;
     let msg;
     try { msg = JSON.parse(lines[i]); } catch { continue; }
+    msg = normalizeClaudeQueuedInput(msg);
     if (!VALID_TYPES.has(msg.type)) continue;
-    if ((msg.isMeta || msg.isCompactSummary) && msg.type === 'user') { metaUuids.add(msg.uuid); continue; }
+    if ((msg.isMeta || msg.isCompactSummary) && msg.type === 'user') {
+      if (!isClaudeLocalCommandCaveat(msg)) metaUuids.add(msg.uuid);
+      continue;
+    }
     if (msg.type === 'user' && msg.parentUuid && metaUuids.has(msg.parentUuid)) { metaUuids.delete(msg.parentUuid); continue; }
     const extracted = await extractForApp(msg);
     if (!extracted.uuid) continue;
+    extracted.orderKey = nativeOrderKey(i);
     if (extracted.type === 'ai-title' || extracted.type === 'custom-title' || extracted.type === 'last-prompt') {
       if (metaIdx[extracted.type] !== undefined) newMsgs[metaIdx[extracted.type]] = extracted;
       else { metaIdx[extracted.type] = newMsgs.length; newMsgs.push(extracted); }
@@ -193,36 +238,36 @@ export async function readNewMessages(filePath, sessionId) {
     newMsgs.push(extracted);
   }
 
-  synced.set(sessionId, lines.length);
-  return newMsgs;
+  return { messages: newMsgs, nextLine: lines.length };
 }
 
-// Read ALL messages from a session file (for on-demand sync)
-export async function readAllMessages(filePath, sessionId) {
-  synced.delete(sessionId); // Reset position to read from beginning
-  return readNewMessages(filePath, sessionId);
-}
-
-export async function uploadMessages(sessionId, messages) {
-  if (messages.length === 0) return;
+export async function uploadMessages(sessionId, messages, options = {}) {
+  if (messages.length === 0 && !options.historyComplete) return;
   let batch = [];
   let batchSize = 0;
+  const identity = {
+    ...(options.runtime ? { runtime: options.runtime } : {}),
+    ...(options.nativeSessionId ? { nativeSessionId: options.nativeSessionId } : {}),
+  };
 
-  for (const raw of messages) {
-    // Cap each message under the DDB single-item limit before it ever hits DDB
-    // (covers both the WS-oversize HTTP fallback and initial full sync).
+  for (const raw of toolPreviews(messages)) {
+    // Cap every message before WS fallback or initial sync reaches DDB.
     const msg = truncateToBytes(raw, DDB_ITEM_LIMIT);
     const msgJson = JSON.stringify(msg);
-    if (batchSize + msgJson.length > MAX_POST_BYTES && batch.length > 0) {
-      await post('/api/bridge/sync-messages', { sessionId, messages: batch });
+    const msgBytes = Buffer.byteLength(msgJson);
+    if (batchSize + msgBytes > MAX_POST_BYTES && batch.length > 0) {
+      await postRequired('/api/bridge/sync-messages', { sessionId, messages: batch, ...identity });
       await new Promise(r => setTimeout(r, 200));
       batch = [];
       batchSize = 0;
     }
     batch.push(msg);
-    batchSize += msgJson.length;
+    batchSize += msgBytes;
   }
   if (batch.length > 0) {
-    await post('/api/bridge/sync-messages', { sessionId, messages: batch });
+    await postRequired('/api/bridge/sync-messages', { sessionId, messages: batch, ...identity });
+  }
+  if (options.historyComplete) {
+    await postRequired('/api/bridge/sync-messages', { sessionId, messages: [], historyComplete: true, ...identity });
   }
 }

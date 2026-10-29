@@ -1,8 +1,8 @@
 #!/usr/bin/env node
 /**
- * Claude Code Bridge — watches .jsonl session files and syncs to server.
+ * Baton Bridge — syncs supported local agent runtimes to the server.
  *
- * Config: ~/.claude-bridge/config.json
+ * Config: ~/.baton-bridge/config.json
  *   { "server": "https://xxx.execute-api.xxx.amazonaws.com/v1", "apiKey": "sk-xxx", "deviceName": "MyMac" }
  */
 
@@ -10,108 +10,152 @@ import { spawn } from 'child_process';
 import fs from 'fs';
 import os from 'os';
 import path from 'path';
-import { CLAUDE_PROJECTS, CHECK_STOPPED_INTERVAL, CHECK_UPDATE_INTERVAL, BRIDGE_HOME } from './config.mjs';
-import { loadConfig, fetchServerConfig, saveConfig } from './config.mjs';
+import { CLAUDE_PROJECTS, CHECK_STOPPED_INTERVAL, BRIDGE_HOME } from './config.mjs';
+import { loadConfig, fetchServerConfig, removeServiceKeyArgs, saveConfig } from './config.mjs';
+import { acquireInstanceLock } from './instance-lock.mjs';
 import { initHttp } from './http.mjs';
 import { syncSessions, checkStopped, reconcile } from './sync.mjs';
-import { startWatcher, startJobsWatcher } from './watcher.mjs';
-import { initWs } from './ws.mjs';
+import { startRuntimeWatchers } from './runtime-watcher-registry.mjs';
+import { closeTerminalsForUpdate, initWs, shutdownInteractions, setUpdateChecker, wsSendWhenConnected } from './ws.mjs';
 import { loadSynced, saveSynced } from './extract.mjs';
+import { BRIDGE_VERSION } from './version.mjs';
+import {
+  cleanupStagedBridge,
+  cleanupUpdateWorkspace,
+  createUpdateWorkspace,
+  installStagedBridge,
+} from './updater.mjs';
+import { extractTar, installProductionDependencies } from './platform.mjs';
 
-// Ensure single instance via PID lock file (cross-platform, works on WSL too)
-const LOCK_FILE = path.join(BRIDGE_HOME, 'bridge.pid');
-try {
-  if (!fs.existsSync(BRIDGE_HOME)) fs.mkdirSync(BRIDGE_HOME, { recursive: true });
-  if (fs.existsSync(LOCK_FILE)) {
-    const oldPid = parseInt(fs.readFileSync(LOCK_FILE, 'utf-8').trim());
-    if (oldPid && oldPid !== process.pid) {
-      try { process.kill(oldPid); console.log(`[init] killed old bridge (PID ${oldPid})`); } catch {}
-    }
-  }
-  fs.writeFileSync(LOCK_FILE, String(process.pid));
-} catch {}
-process.on('exit', () => { saveSynced(); try { fs.unlinkSync(LOCK_FILE); } catch {} });
-process.on('SIGTERM', () => process.exit(0));
-process.on('SIGINT', () => process.exit(0));
+const releaseInstanceLock = await acquireInstanceLock(BRIDGE_HOME);
+if (!releaseInstanceLock) {
+  console.log('[init] another Bridge instance is already running; exiting');
+  process.exit(0);
+}
+process.on('exit', () => { try { saveSynced(); } finally { releaseInstanceLock(); } });
+let shuttingDown = false;
+let updateInProgress = false;
+let nextUpdateCheckAt = 0;
+let wsConfigRetry = null;
+async function shutdownBridge(exitCode = 0) {
+  if (shuttingDown) return;
+  shuttingDown = true;
+  clearInterval(wsConfigRetry);
+  await shutdownInteractions();
+  process.exit(exitCode);
+}
+process.on('SIGTERM', () => { shutdownBridge(0).catch(() => process.exit(1)); });
+process.on('SIGINT', () => { shutdownBridge(0).catch(() => process.exit(1)); });
 
 const CONFIG = loadConfig();
+if (removeServiceKeyArgs()) console.log('[init] removed the key from the service definition');
+cleanupStagedBridge(BRIDGE_HOME);
 initHttp(CONFIG);
 loadSynced(); // restore per-session watermarks before initial sync, so old sessions aren't re-read from 0
 setInterval(saveSynced, 60_000).unref(); // crash-fallback flush; exit handler covers clean restarts
 
-// Auto-discover WS URL from server (retry every 5 min if network unavailable at boot)
 const serverConfig = await fetchServerConfig(CONFIG);
-if (serverConfig.wsUrl) CONFIG.wsUrl = serverConfig.wsUrl;
+if (serverConfig.wsUrl) { CONFIG.wsUrl = serverConfig.wsUrl; saveConfig(CONFIG); }
 
-console.log('claude-bridge started');
+console.log('Baton Bridge started');
 console.log(`  device:   ${CONFIG.deviceName}`);
 console.log(`  server:   ${CONFIG.server}`);
 if (CONFIG.wsUrl) console.log(`  ws:       ${CONFIG.wsUrl}`);
 console.log(`  watching: ${CLAUDE_PROJECTS}`);
 
 if (CONFIG.wsUrl) {
-  initWs(CONFIG);
+  initWs(CONFIG, { onSuperseded: () => shutdownBridge(0) });
 } else {
-  console.log('[ws] wsUrl not available, will retry every 5 min');
-  const wsRetry = setInterval(async () => {
+  console.log('[ws] wsUrl not available, will retry every 5 seconds');
+  wsConfigRetry = setInterval(async () => {
     const sc = await fetchServerConfig(CONFIG);
-    if (sc.wsUrl) { CONFIG.wsUrl = sc.wsUrl; clearInterval(wsRetry); initWs(CONFIG); }
-  }, 5 * 60_000);
+    if (shuttingDown) return;
+    if (sc.wsUrl) {
+      CONFIG.wsUrl = sc.wsUrl;
+      saveConfig(CONFIG);
+      clearInterval(wsConfigRetry);
+      initWs(CONFIG, { onSuperseded: () => shutdownBridge(0) });
+    }
+  }, 5000);
 }
 // Always run metadata sync (status check + DEV/PROJ/SESS items + lastKnownStatus map).
 // --skip-init only skips replaying historical messages — metadata is cheap and required
 // for the periodic checkStopped() to detect disappeared CC processes.
-await syncSessions(CONFIG, { skipMessages: !!CONFIG.skipInit });
+const initialSync = await syncSessions(CONFIG, { skipMessages: !!CONFIG.skipInit });
 if (CONFIG.skipInit) console.log('[skip-init] metadata synced; skipping historical message upload');
+if (initialSync?.messageCount > 0 && CONFIG.wsUrl) {
+  wsSendWhenConnected({
+    action: 'bridge_recovery_complete',
+    deviceName: CONFIG.deviceName,
+    count: initialSync.messageCount,
+  });
+}
 // syncSessions has awaited every SESS# write, so DDB is complete — recount now
 // (covers first boot + post-upgrade restart). New projects reconcile via the watcher.
-await reconcile(CONFIG);
+if (initialSync?.catalogComplete !== false) await reconcile(CONFIG);
+else console.log('[sync] reconcile skipped because local discovery was incomplete');
 checkStopped(CONFIG); // run once on boot — pool is empty after restart, so settle just-orphaned running rows now
 setInterval(() => checkStopped(CONFIG), CHECK_STOPPED_INTERVAL);
 
-// Self-update: every CHECK_UPDATE_INTERVAL, compare local vs server version.
-// First tick after boot is a calibration (records version, never upgrades) so
-// that re-installing doesn't loop. Subsequent ticks trigger reinstall on mismatch.
-let _firstUpdateTick = true;
+// Compare the immutable package version; config.json is user state.
 async function checkUpdate() {
+  if (shuttingDown || updateInProgress || Date.now() < nextUpdateCheckAt) return;
+  nextUpdateCheckAt = Date.now() + 4 * 60_000;
+  updateInProgress = true;
   try {
-    const res = await fetch(`${CONFIG.server}/api/version`, { headers: { 'x-api-key': CONFIG.apiKey } });
+    const res = await fetch(`${CONFIG.server}/api/version`, {
+      headers: { 'x-api-key': CONFIG.apiKey },
+      signal: AbortSignal.timeout(10_000),
+    });
     if (!res.ok) return;
-    const { version } = await res.json();
-    if (!version || version === 'dev') return;
-    if (_firstUpdateTick) {
-      _firstUpdateTick = false;
-      if (CONFIG.version !== version) { CONFIG.version = version; saveConfig(CONFIG); }
-      return;
-    }
-    if (version === CONFIG.version) return;
-    console.log(`[update] ${CONFIG.version} → ${version}, updating...`);
+    const info = await res.json();
+    const version = info.bridgeVersion || info.version;
+    if (!version || version === 'dev' || version === BRIDGE_VERSION) return;
+    console.log(`[update] ${BRIDGE_VERSION} → ${version}, updating...`);
     const serverBase = CONFIG.server.replace(/\/$/, '');
     const nameParam = encodeURIComponent(CONFIG.deviceName || os.hostname());
     const url = `${serverBase}/api/install?name=${nameParam}`;
     try {
-      const res = await fetch(url, { headers: { 'x-api-key': CONFIG.apiKey } });
+      const res = await fetch(url, {
+        headers: { 'x-api-key': CONFIG.apiKey },
+        signal: AbortSignal.timeout(30_000),
+      });
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
       const script = await res.text();
       const tarMatch = script.match(/curl -sL "([^"]+)"/);
       if (!tarMatch) throw new Error('no tar URL in install script');
       const tarUrl = tarMatch[1];
-      const { execSync: ex } = await import('child_process');
-      const tgz = path.join(BRIDGE_HOME, '.update.tgz');
-      ex(`curl -fsSL "${tarUrl}" -o "${tgz}" && tar xzf "${tgz}" -C "${BRIDGE_HOME}" && rm -f "${tgz}"`, { stdio: 'ignore' });
-      ex(`node --check "${path.join(BRIDGE_HOME, 'bridge.mjs')}"`, { stdio: 'ignore' });
-      ex('npm install --production --silent 2>/dev/null', { cwd: BRIDGE_HOME, stdio: 'ignore' });
-      CONFIG.version = version;
-      saveConfig(CONFIG);
+      const { execFileSync } = await import('child_process');
+      const workspace = createUpdateWorkspace(BRIDGE_HOME);
+      const { archive: tgz, stage } = workspace;
+      try {
+        const packageRes = await fetch(tarUrl, { signal: AbortSignal.timeout(120_000) });
+        if (!packageRes.ok) throw new Error(`package HTTP ${packageRes.status}`);
+        fs.writeFileSync(tgz, Buffer.from(await packageRes.arrayBuffer()));
+        extractTar(tgz, stage);
+        execFileSync(process.execPath, ['--check', path.join(stage, 'bridge.mjs')], { stdio: 'ignore' });
+        installProductionDependencies(stage);
+
+        const stagedVersion = fs.readFileSync(path.join(stage, 'version.mjs'), 'utf-8');
+        if (!stagedVersion.includes(`'${version}'`) && !stagedVersion.includes(`"${version}"`)) {
+          throw new Error('downloaded Bridge version does not match server');
+        }
+
+        if (process.platform === 'win32') await closeTerminalsForUpdate();
+        installStagedBridge(stage, BRIDGE_HOME);
+      } finally {
+        cleanupUpdateWorkspace(workspace);
+      }
       console.log(`[update] files updated, restarting...`);
-      process.exit(1);
+      await shutdownBridge(process.platform === 'win32' ? 75 : 1);
     } catch (e) {
       console.error(`[update] failed: ${e.message}`);
     }
-  } catch {}
+  } catch {} finally {
+    updateInProgress = false;
+  }
 }
 checkUpdate();
-setInterval(checkUpdate, CHECK_UPDATE_INTERVAL);
+setUpdateChecker(checkUpdate);
 
-startWatcher(CONFIG);
-startJobsWatcher(CONFIG);
+startRuntimeWatchers(CONFIG, { initialSessions: initialSync?.sessions || [] });

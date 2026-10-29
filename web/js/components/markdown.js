@@ -2,19 +2,257 @@
 (function () {
   marked.setOptions({ breaks: true, gfm: true });
 
-  // marked v12 dropped the `highlight` option; highlight code tokens up front
-  // with our existing hljs so fenced blocks render colored (zero extra deps).
+  function escHtml(s) {
+    return String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+  }
+
+  // Set only while renderMdDocument parses. Baton's own markup (inline handlers, KaTeX styles)
+  // is parked here so the sanitizer only sees the document's Markdown and raw HTML.
+  var _documentSlots = null;
+  var _chatCode = false;
+  function trusted(html) {
+    if (!_documentSlots) return html;
+    _documentSlots.push(html);
+    return '<span data-baton-slot="' + _documentSlots.nonce + '-' + (_documentSlots.length - 1) + '"></span>';
+  }
+
+  function imageHtml(href, title, text) {
+    var attr = function (value) { return escHtml(value || '').replace(/"/g, '&quot;'); };
+    var label = ' alt="' + (text || '') + '"' + (title ? ' title="' + title + '"' : '');
+    if (/^(?:https?:\/\/|\/\/|data:image\/(?:png|jpeg|gif|webp|avif|bmp|svg\+xml|x-icon)[;,])/i.test(href)) {
+      return '<img class="markdown-image-external" src="' + attr(href) + '"' + label
+        + ' loading="lazy" onclick="event.preventDefault();event.stopPropagation();viewImage(this.src)">';
+    }
+    var key = /^baton-bridge:([a-z0-9._-]+)$/i.exec(href);
+    var filePath = href;
+    if (/^file:/i.test(filePath)) {
+      try {
+        var url = new URL(filePath);
+        if (url.hostname && url.hostname !== 'localhost') return text || '';
+        filePath = url.pathname.replace(/^\/([a-z]:\/)/i, '$1');
+      } catch (error) { return text || ''; }
+    } else if (/^[a-z][a-z\d+.-]*:/i.test(filePath) && !/^[a-z]:[\\/]/i.test(filePath) && !key) {
+      return text || '';
+    }
+    filePath = filePath.replace(/[?#].*$/, '');
+    try { filePath = decodeURIComponent(filePath); } catch (error) {}
+    if (!key && (!/\.(?:png|jpe?g|gif|webp|avif|bmp|svg|ico)$/i.test(filePath)
+      || /[\x00-\x1f]/.test(filePath))) return text || '';
+    return '<span class="img-placeholder markdown-image"'
+      + (key ? ' data-key="' + attr(key[1]) : ' data-path="' + attr(filePath))
+      + '" data-alt="' + (text || '') + '"' + (title ? ' title="' + title + '"' : '')
+      + '>' + (window.loadingSpinner?.({ label: 'Loading image' }) || '') + '</span>';
+  }
+
+  function standaloneJson(text) {
+    var value = String(text || '').trim();
+    if (!value || !((value[0] === '{' && value[value.length - 1] === '}')
+      || (value[0] === '[' && value[value.length - 1] === ']'))) return null;
+    try { return JSON.parse(value); } catch (e) { return null; }
+  }
+
+  function percent(value) {
+    return Number.isFinite(value) ? Math.round(value * 100) + '%' : '';
+  }
+
+  function locationMarkdown(location) {
+    if (!location || !location.absolute_file_path) return '';
+    var path = String(location.absolute_file_path);
+    var range = location.line_range || {};
+    var lines = range.start
+      ? ':' + range.start + (range.end && range.end !== range.start ? '-' + range.end : '')
+      : '';
+    var hash = range.start
+      ? '#L' + range.start + (range.end && range.end !== range.start ? '-L' + range.end : '')
+      : '';
+    var target = (path + hash).replace(/</g, '%3C').replace(/>/g, '%3E');
+    return '[`' + path.replace(/`/g, '\\`') + lines + '`](<' + target + '>)';
+  }
+
+  function reviewMarkdown(review) {
+    if (!review || Array.isArray(review) || !Array.isArray(review.findings)
+      || !Object.prototype.hasOwnProperty.call(review, 'overall_correctness')) return '';
+    var lines = ['## Review result'];
+    if (review.overall_correctness) lines.push('**Result:** ' + review.overall_correctness);
+    var overallConfidence = percent(review.overall_confidence_score);
+    if (overallConfidence) lines.push('**Confidence:** ' + overallConfidence);
+    if (review.overall_explanation) lines.push('', String(review.overall_explanation));
+    review.findings.forEach(function (finding, index) {
+      lines.push('', '### ' + (finding.title || ('Finding ' + (index + 1))));
+      var details = [];
+      if (Number.isFinite(finding.priority)) details.push('Priority: P' + finding.priority);
+      var findingConfidence = percent(finding.confidence_score);
+      if (findingConfidence) details.push('Confidence: ' + findingConfidence);
+      if (details.length) lines.push(details.join(' | '));
+      var location = locationMarkdown(finding.code_location);
+      if (location) lines.push('**Location:** ' + location);
+      if (finding.body) lines.push('', String(finding.body));
+    });
+    return lines.join('\n');
+  }
+
+  function jsonHtml(value) {
+    var code = JSON.stringify(value, null, 2);
+    try {
+      return codeBlock('<pre><code class="hljs">' + hljs.highlight(code, { language: 'json' }).value + '</code></pre>', 'json', true);
+    } catch (e) {
+      return codeBlock('<pre><code>' + escHtml(code) + '</code></pre>', 'json', true);
+    }
+  }
+
+  function codeBlock(html, language, chat = _chatCode) {
+    if (!chat || _documentSlots || !window.copyButtonHtml) return html;
+    return '<div class="code-block"><div class="code-block-head"><span class="code-language">'
+      + escHtml(hljs.getLanguage(language)?.name || language || '') + '</span>'
+      + window.copyButtonHtml('code') + '</div>' + html + '</div>';
+  }
+
+  function chatMarkdown(text) {
+    var previous = _chatCode;
+    _chatCode = true;
+    try { return window.renderMd(text); } finally { _chatCode = previous; }
+  }
+
+  function mermaidCodeHtml(code) {
+    try { return hljs.highlight(code, { language: 'mermaid' }).value; }
+    catch (e) { return escHtml(code); }
+  }
+
+  // Inner HTML of a .mermaid-block, shared by walkTokens + the streaming reconciler (identical structure).
+  window.mermaidInnerHtml = function (code) {
+    return '<div class="mermaid-head">'
+      + '<button class="mermaid-tab active" onclick="toggleMermaidView(this,\'diagram\')">diagram</button>'
+      + '<button class="mermaid-tab" onclick="toggleMermaidView(this,\'code\')">code</button>'
+      + (window.copyButtonHtml?.('mermaid') || '')
+      + '<button class="mermaid-zoom" title="Fullscreen" onclick="openMermaidFullscreen(this)" aria-label="Fullscreen">'
+      + '<svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M15 3h6v6"/><path d="M9 21H3v-6"/><path d="M21 3l-7 7"/><path d="M3 21l7-7"/></svg>'
+      + '</button>'
+      + '</div>'
+      + '<div class="mermaid-src" hidden>' + escHtml(code) + '</div>'
+      + '<div class="mermaid-svg" role="button" tabindex="0" aria-label="Fullscreen diagram"'
+      + ' onclick="openMermaidFullscreen(this)"'
+      + ' onkeydown="if(event.key===\'Enter\'||event.key===\' \'){event.preventDefault();openMermaidFullscreen(this)}"></div>'
+      + '<pre class="mermaid-code"><code class="hljs">' + mermaidCodeHtml(code) + '</code></pre>';
+  };
+
+  // Update a block's source (code tab + hidden src) WITHOUT touching .mermaid-svg (re-rendered async elsewhere).
+  window.setMermaidSource = function (block, code) {
+    var srcEl = block.querySelector('.mermaid-src');
+    if (srcEl) srcEl.textContent = code;
+    var codeEl = block.querySelector('.mermaid-code code');
+    if (codeEl) codeEl.innerHTML = mermaidCodeHtml(code);
+  };
+
   marked.use({
-    walkTokens: function (token) {
-      if (token.type !== 'code') return;
-      var code = token.text || '';
-      var html;
-      if (token.lang && hljs.getLanguage(token.lang)) {
-        try { html = hljs.highlight(code, { language: token.lang }).value; } catch (e) {}
-      }
-      if (html == null) { try { html = hljs.highlightAuto(code).value; } catch (e) {} }
-      if (html != null) { token.type = 'html'; token.text = '<pre><code class="hljs">' + html + '</code></pre>'; }
+    tokenizer: {
+      emStrong: function (src) {
+        var match = /^\*\*((?=[\p{L}\p{N}])[^*\\`_<>\[\]\r\n]*[，。！？：；、）】》」』])\*\*(?=\p{Script=Han})/u.exec(src);
+        if (!match) return false;
+        return {
+          type: 'strong', raw: match[0], text: match[1],
+          tokens: this.lexer.inlineTokens(match[1]),
+        };
+      },
     },
+    renderer: {
+      image: function (href, title, text) {
+        if (_documentSlots && /#gh-light-mode-only$/.test(href || '')) return '';
+        return trusted(imageHtml(href, title, text));
+      },
+      // Assistant output is untrusted. Raw HTML must remain visible text instead of
+      // being inserted into Baton's document where <style>/<meta> can alter the UI.
+      html: function (html) {
+        return _documentSlots ? html : escHtml(html);
+      },
+      // marked v12 dropped the old highlight option, so fenced code is rendered here.
+      code: function (code, lang) {
+        code = code || '';
+        lang = (lang || '').trim().split(/\s+/)[0];
+        // Mermaid: emit a placeholder (mermaid.js fills the SVG async). Marked also
+        // recognizes an unclosed fence while content is streaming.
+        if (lang.toLowerCase() === 'mermaid') {
+          return trusted('<div class="mermaid-block">' + window.mermaidInnerHtml(code) + '</div>');
+        }
+        // GitHub renders ```math fences as display math.
+        if (_documentSlots && lang.toLowerCase() === 'math' && window.katexHtml) {
+          return trusted(window.katexHtml(code.trim(), true));
+        }
+        var html;
+        if (lang && hljs.getLanguage(lang)) {
+          try { html = hljs.highlight(code, { language: lang }).value; } catch (e) {}
+        }
+        // Unlabeled code stays plain; an unloaded language is highlighted once it loads.
+        if (html == null && lang && !hljs.getLanguage(lang) && window.loadHljsLanguage) {
+          window.loadHljsLanguage(lang);
+          return trusted(codeBlock('<pre><code class="hljs" data-hljs-language="' + escHtml(lang.toLowerCase()).replace(/"/g, '&quot;') + '">'
+            + escHtml(code) + '</code></pre>', lang));
+        }
+        if (html == null) html = escHtml(code);
+        return trusted(codeBlock('<pre><code class="hljs">' + html + '</code></pre>', lang));
+      },
+    },
+  });
+
+  function visualizationToken(src) {
+    var match = /^visualize([^\r\n]*?)/.exec(src);
+    if (!match) return;
+    try {
+      var value = JSON.parse(match[1]);
+      if (!value || typeof value.path !== 'string' || !value.path.trim()
+        || !/\.html?$/i.test(value.path) || /[\x00-\x1f]/.test(value.path)) return;
+      return { type: 'codexVisualization', raw: match[0], text: value.path };
+    } catch (error) {}
+  }
+
+  window.visualizationHtml = function (filePath) {
+    var safePath = escHtml(filePath).replace(/"/g, '&quot;');
+    return '<span class="codex-visualization" data-visualization-path="' + safePath + '">'
+      + '<span class="visualization-status">' + (window.loadingSpinner?.({ label: 'Loading preview' }) || '') + '</span>'
+      + '</span>';
+  };
+
+  marked.use({ extensions: ['block', 'inline'].map(function (level) {
+    return {
+      name: 'codexVisualization',
+      level: level,
+      start: function (src) {
+        var index = src.indexOf(level === 'block' ? '\nvisualize' : 'visualize');
+        return index < 0 ? undefined : index + (level === 'block' ? 1 : 0);
+      },
+      tokenizer: visualizationToken,
+      renderer: function (token) { return trusted(window.visualizationHtml(token.text)); },
+    };
+  }) });
+
+  // LaTeX math via katex.js. Tokenized (not post-DOM) so $$…$$ content keeps its & and \\ —
+  // marked would otherwise escape & → &amp; and (breaks:true) split the block with <br>.
+  var mathBlock = {
+    name: 'mathBlock', level: 'block',
+    start: function (src) { var m = /(?:^|\n)[ \t]*(?:\$\$|\\\[)/.exec(src); return m ? m.index : undefined; },
+    tokenizer: function (src) {
+      var m = /^[ \t]*\$\$[ \t]*\r?\n([\s\S]+?)\r?\n[ \t]*\$\$[ \t]*(?:\n|$)/.exec(src)   // $$ on its own lines
+           || /^[ \t]*\$\$([^\n]+?)\$\$/.exec(src)                                        // single-line $$…$$
+           || /^[ \t]*\\\[[ \t]*\r?\n([\s\S]+?)\r?\n[ \t]*\\\][ \t]*(?:\n|$)/.exec(src)   // \[ on its own lines
+           || /^[ \t]*\\\[([\s\S]+?)\\\]/.exec(src);                                      // single-line \[…\]
+      if (m) return { type: 'mathBlock', raw: m[0], text: m[1].trim() };
+    },
+    renderer: function (t) { return window.katexHtml ? trusted(window.katexHtml(t.text, true)) : t.raw; },
+  };
+  var mathInline = {
+    name: 'mathInline', level: 'inline',
+    start: function (src) { var m = src.match(/\$|\\\(/); return m ? m.index : undefined; },
+    tokenizer: function (src) {
+      var m = /^\$([^\$\n]+?)\$/.exec(src) || /^\\\(([\s\S]+?)\\\)/.exec(src);
+      if (m) return { type: 'mathInline', raw: m[0], text: m[1].trim() };
+    },
+    renderer: function (t) { return window.katexHtml ? trusted(window.katexHtml(t.text, false)) : t.raw; },
+  };
+  // A `$$`/`\[` math line right under a **bold** line must not be swallowed as a setext heading underline.
+  marked.use({
+    tokenizer: {
+      lheading: function (src) { return /^[^\n]+\n[ \t]*(?:\$\$|\\\[)/.test(src) ? undefined : false; },
+    },
+    extensions: [mathBlock, mathInline],
   });
 
   function rewriteFileLinks(html) {
@@ -26,6 +264,7 @@
       if (/^(mailto:|#|\/\/|tel:|data:)/i.test(href)) return m;
       var hash = (href.match(/#L?(\d+(?:[-,]L?\d+)?)/) || [])[1] || '';
       var path = href.replace(/#.*$/, '');
+      try { path = decodeURIComponent(path); } catch (e) {}
       var colon = path.match(/^(.*?):(\d+(?:-\d+)?)$/);
       if (colon) { path = colon[1]; hash = hash || colon[2]; }
       if (!path) return m;
@@ -36,8 +275,191 @@
     });
   }
 
+  function linkifyPreviewAddresses(html) {
+    if (!/(?:localhost|127\.0\.0\.1|\[::1\]):\d/i.test(html)) return html;
+    var template = document.createElement('template');
+    template.innerHTML = html;
+    var walker = document.createTreeWalker(template.content, NodeFilter.SHOW_TEXT);
+    var nodes = [];
+    while (walker.nextNode()) {
+      if (!walker.currentNode.parentElement?.closest('a, pre, .mermaid-block, .katex, .file-link')) {
+        nodes.push(walker.currentNode);
+      }
+    }
+    nodes.forEach(function (node) {
+      var text = node.textContent;
+      var pattern = /(?:http:\/\/)?(?:localhost|127\.0\.0\.1|\[::1\]):\d{1,5}(?!\d)(?:[/?#][^\s<>"`\\]*)?/gi;
+      var fragment = document.createDocumentFragment();
+      var offset = 0;
+      var match;
+      while ((match = pattern.exec(text))) {
+        if (/[\w./:@-]/.test(text[match.index - 1] || '')
+          || /[\w:@-]/.test(text[pattern.lastIndex] || '')) continue;
+        var address = match[0].replace(/[.,;!，。；！？、）]+$/, '');
+        while (address.endsWith(')')
+          && address.split(')').length > address.split('(').length) address = address.slice(0, -1);
+        var url;
+        try { url = new URL(/^http:/i.test(address) ? address : 'http://' + address); }
+        catch (error) { continue; }
+        if (url.port === '0') continue;
+        fragment.appendChild(document.createTextNode(text.slice(offset, match.index)));
+        var link = document.createElement('a');
+        link.href = url.href;
+        link.className = 'ext-link';
+        link.target = '_blank';
+        link.rel = 'noopener noreferrer';
+        link.textContent = address;
+        fragment.appendChild(link);
+        offset = match.index + address.length;
+      }
+      if (!offset) return;
+      fragment.appendChild(document.createTextNode(text.slice(offset)));
+      node.replaceWith(fragment);
+    });
+    return template.innerHTML;
+  }
+
+  window.linkifyPreviewAddresses = linkifyPreviewAddresses;
+
   window.renderMd = function (text) {
     if (!text || !text.trim()) return '';
-    return rewriteFileLinks(marked.parse(text));
+    return linkifyPreviewAddresses(rewriteFileLinks(marked.parse(text)));
+  };
+
+  // Project files render like GitHub: raw HTML is kept and soft line breaks are not <br>.
+  // `sanitize(html)` must return an element holding only allowlisted markup.
+  window.renderMdDocument = function (text, sanitize) {
+    if (!text || !text.trim()) return '';
+    var slots = [];
+    slots.nonce = Math.random().toString(36).slice(2);
+    _documentSlots = slots;
+    var html;
+    try { html = marked.parse(text, { breaks: false }); } finally { _documentSlots = null; }
+    var root = sanitize(html);
+    root.querySelectorAll('span[data-baton-slot]').forEach(function (el) {
+      var match = /^(.+)-(\d+)$/.exec(el.dataset.batonSlot);
+      if (match && match[1] === slots.nonce && slots[match[2]] != null) el.outerHTML = slots[match[2]];
+      else el.remove();
+    });
+    return root.innerHTML;
+  };
+
+  window.renderAssistantText = function (text) {
+    var json = standaloneJson(text);
+    if (json == null) return chatMarkdown(text);
+    var review = reviewMarkdown(json);
+    return review ? chatMarkdown(review) : jsonHtml(json);
+  };
+
+  // Split streamed text at ```mermaid fences (counts even while unclosed) → [{type:'text'|'mermaid', text}].
+  function splitMermaid(text) {
+    var re = /(^|\n)```[ \t]*mermaid[ \t]*(?:\n|$)/gi;
+    var segs = [], last = 0, m;
+    while ((m = re.exec(text)) !== null) {
+      var fenceStart = m.index + m[1].length;       // start of the ``` line
+      var bodyStart = m.index + m[0].length;         // first char after the fence line
+      if (fenceStart > last) segs.push({ type: 'text', text: text.slice(last, fenceStart) });
+      // Body runs until the closing ``` (on its own line) or end-of-text (still streaming).
+      var close = text.slice(bodyStart).search(/\n```[ \t]*(?:\n|$)/);
+      var code, next;
+      if (close === -1) { code = text.slice(bodyStart); next = text.length; }
+      else {
+        code = text.slice(bodyStart, bodyStart + close);
+        var afterFence = text.indexOf('\n', bodyStart + close + 1);
+        next = afterFence === -1 ? text.length : afterFence + 1;
+      }
+      segs.push({ type: 'mermaid', text: code });
+      last = next; re.lastIndex = next;
+    }
+    if (last < text.length) segs.push({ type: 'text', text: text.slice(last) });
+    return segs;
+  }
+
+  function updateMarkdownHtml(host, html) {
+    var selector = '.img-placeholder, img.markdown-image-external';
+    var images = new Map();
+    var identity = function (node) {
+      return node.dataset.path ? 'path:' + node.dataset.path
+        : node.dataset.key ? 'key:' + node.dataset.key : 'src:' + node.getAttribute('src');
+    };
+    host.querySelectorAll(selector).forEach(function (node) {
+      var key = identity(node);
+      if (!images.has(key)) images.set(key, []);
+      images.get(key).push(node);
+    });
+    if (!images.size) { host.innerHTML = html; return; }
+    var template = document.createElement('template');
+    template.innerHTML = html;
+    template.content.querySelectorAll(selector).forEach(function (node) {
+      var previous = images.get(identity(node))?.shift();
+      if (!previous) return;
+      if (node.hasAttribute('title')) previous.title = node.title;
+      else previous.removeAttribute('title');
+      if (node.dataset.alt != null) {
+        previous.dataset.alt = node.dataset.alt;
+        var image = previous.querySelector('img');
+        if (image) image.alt = node.dataset.alt;
+      } else if (node.tagName === 'IMG') previous.alt = node.alt;
+      node.replaceWith(previous);
+    });
+    host.replaceChildren(template.content);
+  }
+
+  // Keep decoded images and pending loads alive while streamed text changes around them.
+  window.renderStreamMd = function (host, text) {
+    var segs = splitMermaid(text || '');
+    if ((text || '').includes('visualize')) {
+      segs = segs.flatMap(function (segment) {
+        if (segment.type !== 'text') return [segment];
+        var result = [];
+        marked.lexer(segment.text).forEach(function (token) {
+          if (token.type === 'codexVisualization') {
+            result.push({ type: 'visualization', text: token.text });
+          } else if (result.length && result[result.length - 1].type === 'text') {
+            result[result.length - 1].text += token.raw;
+          } else {
+            result.push({ type: 'text', text: token.raw });
+          }
+        });
+        return result;
+      });
+    }
+    var hasPersistentBlocks = false;
+    for (var i = 0; i < segs.length; i++) if (segs[i].type !== 'text') { hasPersistentBlocks = true; break; }
+    if (!hasPersistentBlocks) { updateMarkdownHtml(host, chatMarkdown(text)); return; }
+
+    var children = host.childNodes;
+    for (var s = 0; s < segs.length; s++) {
+      var seg = segs[s];
+      var node = children[s];
+      if (seg.type === 'text') {
+        var html = chatMarkdown(seg.text);
+        if (!node || node.nodeType !== 1 || node.className !== 'md-seg') { // insert/replace a text wrapper
+          var w = document.createElement('div');
+          w.className = 'md-seg'; w.innerHTML = html; w.dataset.h = html;
+          if (node) host.replaceChild(w, node); else host.appendChild(w);
+        } else if (node.dataset.h !== html) { // reuse in place, rewrite only on change
+          updateMarkdownHtml(node, html); node.dataset.h = html;
+        }
+      } else if (seg.type === 'visualization') {
+        if (!node || node.nodeType !== 1 || node.dataset.visualizationPath !== seg.text) {
+          var template = document.createElement('template');
+          template.innerHTML = window.visualizationHtml(seg.text);
+          var preview = template.content.firstChild;
+          if (node) host.replaceChild(preview, node); else host.appendChild(preview);
+        }
+      } else {
+        if (!node || node.nodeType !== 1 || !node.classList || !node.classList.contains('mermaid-block')) { // insert a fresh block
+          var b = document.createElement('div');
+          b.className = 'mermaid-block';
+          b.innerHTML = window.mermaidInnerHtml(seg.text);
+          if (node) host.replaceChild(b, node); else host.appendChild(b);
+        } else { // reuse the live block, only update its source
+          var curSrc = node.querySelector('.mermaid-src');
+          if (!curSrc || curSrc.textContent !== seg.text) window.setMermaidSource(node, seg.text);
+        }
+      }
+    }
+    while (host.childNodes.length > segs.length) host.removeChild(host.lastChild); // drop trailing stale nodes
   };
 })();

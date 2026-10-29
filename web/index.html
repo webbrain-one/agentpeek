@@ -3,8 +3,20 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover">
-<title>AgentPeek</title>
-<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>🔭</text></svg>">
+<script src="/native-mobile.js"></script>
+<title>Baton</title>
+<link rel="icon" type="image/svg+xml" href="assets/baton-app-icon.svg" media="(prefers-color-scheme: light)">
+<link rel="icon" type="image/svg+xml" href="assets/baton-app-icon-light.svg" media="(prefers-color-scheme: dark)">
+<script>
+  if (sessionStorage.getItem('baton-returning-home') === '1') {
+    window.__returningHome = true;
+    document.documentElement.classList.add('returning-home');
+    sessionStorage.removeItem('baton-returning-home');
+  }
+  addEventListener('pageshow', function () {
+    sessionStorage.removeItem('baton-returning-home');
+  });
+</script>
 <!-- Critical CSS inline — prevents FOUC before bundled CSS loads (mobile webview cold start) -->
 <style>
   *{margin:0;padding:0;box-sizing:border-box;-webkit-tap-highlight-color:transparent}
@@ -16,17 +28,45 @@
      Floor it at 59px (Dynamic Island / notch device standard) to prevent the top-bar
      from briefly touching the top of the screen. -webkit-touch-callout is iOS-only,
      so Android skips this. Once env() resolves, the larger value naturally takes over. */
-  @supports (-webkit-touch-callout:none){.top-bar{padding-top:max(var(--sat,env(safe-area-inset-top)),59px)}}
+  @supports (-webkit-touch-callout:none){html.native-mobile .top-bar{min-height:calc(max(var(--sat,env(safe-area-inset-top,0px)),59px) + 44px);padding-top:max(var(--sat,env(safe-area-inset-top,0px)),59px)}}
   /* iOS WKWebView's frame settles ~50ms after first paint (status bar area gets cropped).
      Hide body briefly on iOS so users see the dark background instead of content jumping down.
      Android renders correctly on first frame, so it skips this. */
-  @supports (-webkit-touch-callout:none){body{opacity:0}body.ready{opacity:1;transition:opacity .1s}}
+  @supports (-webkit-touch-callout:none){html.native-mobile body{opacity:0}html.native-mobile body.ready{opacity:1;transition:none}}
   .top-left{font-size:13px;display:flex;align-items:center;gap:4px;padding:14px 0 14px 24px;margin:-14px 0 -14px -24px}
+  .top-logo{display:inline-flex;align-items:center;justify-content:center;width:18px;height:18px;margin-right:3px}
+  .top-logo img{display:block;width:100%;height:100%}
   .top-title{font-weight:600;color:#e6edf3}
   a.top-gear,a.top-gear:link,a.top-gear:visited{display:flex;align-items:center;justify-content:center;width:28px;height:28px;border-radius:50%;color:#6e7681;text-decoration:none}
+  a.top-gear.syncing,.new-session-btn{position:relative}
+  @keyframes apk-spin{from{transform:rotate(0deg)}to{transform:rotate(360deg)}}
+  a.top-gear.syncing,#top-right.syncing .top-gear{animation:apk-spin 1.8s linear infinite;transition:none}
+  #top-right.syncing .new-session-btn svg{border-color:transparent}
+  #top-right.syncing .new-session-btn::after{content:"";position:absolute;left:3px;top:3px;box-sizing:border-box;width:22px;height:22px;border:1.5px solid currentColor;border-top-color:transparent;border-radius:50%;animation:apk-spin .7s linear infinite;pointer-events:none}
+  .runtime-mark{display:inline-flex;width:16px;height:16px;flex:0 0 16px;align-items:center;justify-content:center;vertical-align:middle}
+  .runtime-icon{display:block;width:16px;height:16px;object-fit:contain}
+  .runtime-mark-codex{position:relative}.runtime-mark-codex .runtime-icon{visibility:hidden}.runtime-mark-codex::before{content:"";position:absolute;left:50%;top:50%;width:16px;height:16px;background:#6e7681;transform:translate(-50%,-50%);-webkit-mask:var(--runtime-codex-image,url("assets/codex.svg")) center/contain no-repeat;mask:var(--runtime-codex-image,url("assets/codex.svg")) center/contain no-repeat;transition:background .15s}
+  @media(hover:hover) and (pointer:fine){#top-right>.runtime-mark-codex:hover::before,.runtime-switch:hover .runtime-mark-codex::before{background:#e6edf3}}
+  html.native-mobile .top-bar{min-height:calc(var(--sat,env(safe-area-inset-top,0px)) + 44px);padding:var(--sat,env(safe-area-inset-top,0px)) 8px 0 12px;border-bottom:0;box-shadow:inset 0 -1px #30363d}
+  html.native-mobile .top-left{min-height:44px;gap:6px;font-size:17px;line-height:21px}
+  html.native-mobile .top-logo{width:20px;height:21px;line-height:21px;flex:0 0 20px;margin-right:0}
+  html.native-mobile .top-title{display:inline-flex;align-items:center;height:21px;line-height:21px}
+  html.native-mobile #top-right{display:flex;align-items:center;min-height:44px;gap:0;line-height:0}
+  html.native-mobile a.top-gear,html.native-mobile a.top-gear:link,html.native-mobile a.top-gear:visited{width:44px;height:44px}
+  html.native-mobile a.top-gear svg{width:22px;height:22px}
+  html.native-mobile .new-session-btn,html.native-mobile .runtime-switch,html.native-mobile #top-right>.runtime-mark{width:44px;height:44px;flex:0 0 44px;margin:0}
+  html.native-mobile .new-session-btn svg{width:26px;height:26px;padding:4px;border-width:1.5px}
+  html.native-mobile #top-right .runtime-mark,html.native-mobile #top-right .runtime-icon{width:24px;height:24px}
+  html.native-mobile #top-right .runtime-mark{flex-basis:24px}
+  #top-right .runtime-mark-codex::before{width:22px;height:22px}
+  html.native-mobile #top-right .runtime-mark-codex::before{width:24px;height:24px;transform:translate(-50%,-50%)}
+  html.native-mobile #top-right>.runtime-mark{width:44px;height:44px;flex-basis:44px}
+  html.native-mobile #top-right.syncing .new-session-btn::after{left:9px;top:9px;width:26px;height:26px;border-width:1.5px}
   .breadcrumb{display:none;flex-shrink:0}
   #content{flex:1;overflow-y:auto}
+  body.browse-view #content{overflow-y:scroll;scrollbar-gutter:stable}
 </style>
+<link rel="stylesheet" href="css/style.css">
 <!-- Inline shell: auth guard + parallel fetch (devices + active-sessions) + first paint.
      Runs before entry-index.js so the network request flies out at HTML parse time.
      entry-index.js loads in parallel (browser default for type=module) and takes over interactivity. -->
@@ -51,16 +91,86 @@
     devices: fetch(server + '/api/bridge/devices', { headers: hdr }).then(function (r) { return r.ok ? r.json() : null; }).catch(function () { return null; })
   };
 
+  // SWR home cache (fixed key, cleared by api.js on logout/key change). Stores raw responses with ISO timestamps so timeAgo() recomputes correctly next open; also drives the compare-skip.
+  var CACHE_KEY = 'apeek_home_cache';
+  var recentProjectsCollapsed = false;
+  var devicesCollapsed = false;
+  var collapsedRecentProjects = new Set();
+  var recentTimeObserver = null;
+  var allRecentProjects = false;
+  var loadingRecentProjects = false;
+  var homeActiveData = null;
+  var homeDeviceData = null;
+  var homeLoadVersion = 0;
+  window.__homeActiveParams = function () {
+    return allRecentProjects ? { allProjects: true } : undefined;
+  };
+  function readCache() {
+    try { return JSON.parse(localStorage.getItem(CACHE_KEY) || 'null'); } catch (e) { return null; }
+  }
+  function writeCache(active, devices) {
+    try { localStorage.setItem(CACHE_KEY, JSON.stringify({ active: active, devices: devices, cachedAt: Date.now() })); } catch (e) {}
+  }
+  // Shared top-right activity indicator for all cached list refreshes.
+  function setSync(syncing) {
+    var topRight = document.getElementById('top-right');
+    if (!topRight) return;
+    topRight.classList.toggle('syncing', syncing);
+    var legacyGear = topRight.querySelector('.top-gear.syncing');
+    if (legacyGear) legacyGear.classList.remove('syncing');
+  }
+  function stopSync() {
+    setSync(false);
+  }
+
   // If user lands on a deep link (#/device/...) OR a saved nav points into a
   // project/session, let app.js handle routing (it restores the deeper view).
   // Only inline-render the home/device-list case (empty hash + top-level nav).
   var hash = (location.hash || '').replace(/^#\/?/, '');
   var navDeep = false;
   try {
-    var _nav = JSON.parse(sessionStorage.getItem('agentpeek-nav') || '{}');
+    var _nav = JSON.parse(sessionStorage.getItem('baton-nav') || '{}');
     navDeep = !!(_nav && (_nav.session || _nav.project));
   } catch (e) {}
   var willRenderInline = !hash && !navDeep;
+
+  var firstWebFrameReadyScheduled = false;
+  var firstWebFrameObserver = null;
+  function markFirstWebFrameReady() {
+    if (window.__skelReady || firstWebFrameReadyScheduled) return;
+    firstWebFrameReadyScheduled = true;
+    var nextFrame = window.requestAnimationFrame || function (fn) { setTimeout(fn, 0); };
+    // Let the Web skeleton or cached content complete two layouts before the
+    // native overlay fades. Then allow the iOS body reveal transition and WebKit
+    // compositor to settle so the native fade never exposes a dim Web frame.
+    nextFrame(function () {
+      nextFrame(function () {
+        if (document.body) document.body.classList.add('ready');
+        setTimeout(function () {
+          window.__skelReady = 1;
+          if (firstWebFrameObserver) {
+            firstWebFrameObserver.disconnect();
+            firstWebFrameObserver = null;
+          }
+        }, 120);
+      });
+    });
+  }
+  window.__markFirstWebFrameReady = markFirstWebFrameReady;
+
+  function observeFirstWebFrame(content) {
+    if (!content || firstWebFrameObserver || window.__skelReady) return;
+    var check = function () {
+      if (!content.firstElementChild) return;
+      markFirstWebFrameReady();
+    };
+    firstWebFrameObserver = new MutationObserver(check);
+    firstWebFrameObserver.observe(content, {
+      childList: true,
+      subtree: true
+    });
+    check();
+  }
 
   function timeAgo(iso) {
     var d = Date.now() - new Date(iso).getTime();
@@ -70,98 +180,393 @@
     return Math.floor(d / 86400000) + 'd ago';
   }
   function osName(os) { return { darwin: 'macOS', linux: 'Linux', win32: 'Windows' }[os] || os || 'unknown'; }
-  function esc(s) { return String(s == null ? '' : s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/'/g, '&#39;'); }
+  function esc(s) { return String(s == null ? '' : s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;').replace(/'/g, '&#39;'); }
+  function attachmentPreviewText(text) {
+    return text.replace(/\[([^\]\r\n]*)\]\((?:baton-file:([0-9a-f]{32}(?:\.[a-z0-9]{1,16})?)|<[^<>\r\n]*[\\/]\.baton-bridge[\\/]attachments[\\/]([0-9a-f]{32}(?:\.[a-z0-9]{1,16})?)>)\)/g,
+      function (reference, label) {
+        try { return decodeURIComponent(label); } catch (error) { return reference; }
+      });
+  }
+  var runtimeIconCacheKey = 'baton-runtime-icons-v1';
+  var runtimeIconCache = {};
+  var runtimeIconPending = {};
+  function validRuntimeSvg(svg) {
+    return typeof svg === 'string' && svg.length < 16384 && /^<svg\s[\s\S]*<\/svg>\s*$/.test(svg);
+  }
+  try {
+    var savedIcons = JSON.parse(sessionStorage.getItem(runtimeIconCacheKey) || '{}');
+    ['claude', 'codex'].forEach(function (runtime) {
+      if (savedIcons && validRuntimeSvg(savedIcons[runtime])) runtimeIconCache[runtime] = savedIcons[runtime];
+    });
+  } catch (e) {}
+  function runtimeIconSource(runtime) {
+    var svg = runtimeIconCache[runtime];
+    return svg ? 'data:image/svg+xml,' + encodeURIComponent(svg)
+      : './assets/' + (runtime === 'codex' ? 'codex.svg' : 'claude-code.svg');
+  }
+  window.__runtimeIconSource = runtimeIconSource;
+  if (runtimeIconCache.codex) {
+    document.documentElement.style.setProperty('--runtime-codex-image', 'url("' + runtimeIconSource('codex') + '")');
+  }
+  document.addEventListener('load', function (event) {
+    var image = event.target;
+    if (image.tagName !== 'IMG' || !image.classList.contains('runtime-icon')) return;
+    var runtime = image.closest('.runtime-mark-codex') ? 'codex' : 'claude';
+    if (runtimeIconCache[runtime] || runtimeIconPending[runtime]) return;
+    runtimeIconPending[runtime] = true;
+    fetch(image.currentSrc || image.src, { cache: 'force-cache' }).then(function (response) {
+      return response.ok ? response.text() : '';
+    }).then(function (svg) {
+      if (!validRuntimeSvg(svg)) return;
+      runtimeIconCache[runtime] = svg;
+      try { sessionStorage.setItem(runtimeIconCacheKey, JSON.stringify(runtimeIconCache)); } catch (e) {}
+    }).catch(function () {}).finally(function () {
+      delete runtimeIconPending[runtime];
+    });
+  }, true);
+  function runtimeIcon(s) {
+    var runtime = String(s.sessionId || '').indexOf('codex:') === 0 ? 'codex' : 'claude';
+    var label = runtime === 'codex' ? 'Codex' : 'Claude Code';
+    return '<span class="runtime-mark' + (runtime === 'codex' ? ' runtime-mark-codex' : '') + '" role="img" aria-label="' + label + '" title="' + label + '">'
+      + '<img class="runtime-icon" width="16" height="16" decoding="sync" src="' + esc(runtimeIconSource(runtime)) + '" alt="" aria-hidden="true"></span>';
+  }
 
-  function renderInline(activeData, devData) {
-    var content = document.getElementById('content');
-    if (!content) return;
-    var html = '';
-    var actives = (activeData && activeData.sessions) || [];
-    if (actives.length) {
-      html += '<div class="section-title">Active Sessions (' + actives.length + ')</div>';
-      html += '<div id="active-section" class="active-grid">';
-      html += actives.map(function (s) {
-        var agentBadge = s.isAgent ? '<span class="badge agent">Agent</span>' : '';
-        var statusLabel = s.status === 'running' ? 'Running' : s.status === 'needs_input' ? 'Needs input' : 'Done';
-        var statusClass = s.status === 'running' ? 'running' : s.status === 'needs_input' ? 'idle' : 'stopped';
-        var title = s.isAgent && s.agentName ? s.agentName : (s.preview || 'No preview');
-        var detail = s.status === 'needs_input' && s.agentDetail ? s.agentDetail : '';
-        return '<div class="active-card ' + esc(statusClass) + '"'
-          + ' data-nav="active"'
-          + ' data-sid="' + esc(s.sessionId) + '"'
-          + ' data-preview="' + esc(s.preview || '') + '"'
-          + ' data-status="' + esc(s.status) + '"'
-          + ' data-device="' + esc(s.deviceName) + '"'
-          + ' data-phash="' + esc(s.projectHash) + '"'
-          + ' data-pname="' + esc(s.projectName) + '"'
-          + ' data-isagent="' + (s.isAgent ? 'true' : '') + '">'
-          + '<div class="card-header"><span class="card-project">' + esc(s.projectName) + '</span><span class="card-badges">' + agentBadge + '<span class="badge ' + esc(statusClass) + '">' + statusLabel + '</span></span></div>'
-          + '<div class="card-title"><span class="card-title-text">' + esc(title) + '</span>' + (detail ? '<span class="card-detail">' + esc(detail) + '</span>' : '') + '</div>'
-          + '<div class="card-bottom"><span class="card-device">' + esc(s.deviceName) + '</span><span class="card-time">' + timeAgo(s.lastActive) + '</span></div>'
-          + '</div>';
-      }).join('');
-      html += '</div>';
+  function fitRecentTimeColumn() {
+    if (recentTimeObserver) recentTimeObserver.disconnect();
+    var section = document.getElementById('recent-projects-section');
+    if (!section) return;
+    var previous = section.querySelector('.recent-time-measure');
+    if (previous) previous.remove();
+    var labels = section.querySelectorAll('.recent-session-time-short');
+    if (!labels.length) return;
+    // Measure every loaded label, including folded projects, using the same
+    // font as the visible times. One shared width keeps runtime icons aligned.
+    var measure = document.createElement('span');
+    measure.className = 'recent-session-time recent-time-measure';
+    measure.setAttribute('aria-hidden', 'true');
+    labels.forEach(function (label) {
+      var sample = document.createElement('span');
+      sample.textContent = label.textContent;
+      measure.appendChild(sample);
+    });
+    section.appendChild(measure);
+    function updateWidth() {
+      var width = Math.ceil(measure.getBoundingClientRect().width);
+      if (width > 0) section.style.setProperty('--recent-time-width', width + 'px');
     }
-    var recentSessions = (activeData && activeData.recentSessions) || [];
-    if (recentSessions.length) {
-      var raCollapsed = localStorage.getItem('apeek_raCollapsed') !== '0';
-      var chevron = '<svg class="collapse-arrow" viewBox="0 0 16 16"><path d="M6 3l5 5-5 5"/></svg>';
-      html += '<div id="recent-agents-section">';
-      html += '<div class="section-title collapsible' + (raCollapsed ? '' : ' expanded') + '" onclick="toggleRecentAgents()">Completed Sessions (' + recentSessions.length + ') ' + chevron + '</div>';
-      html += '<div class="active-grid" id="recent-agents-grid" style="' + (raCollapsed ? 'display:none' : '') + '">';
-      html += recentSessions.map(function (s) {
-        var title = s.isAgent && s.agentName ? s.agentName : (s.preview || 'No preview');
-        var agentBadge = s.isAgent ? '<span class="badge agent">Agent</span>' : '';
-        return '<div class="active-card stopped" data-nav="active"'
-          + ' data-sid="' + esc(s.sessionId) + '"'
-          + ' data-preview="' + esc(s.preview || '') + '"'
-          + ' data-status="' + esc(s.status) + '"'
-          + ' data-device="' + esc(s.deviceName) + '"'
-          + ' data-phash="' + esc(s.projectHash) + '"'
-          + ' data-pname="' + esc(s.projectName) + '"'
-          + ' data-isagent="' + (s.isAgent ? 'true' : '') + '">'
-          + '<div class="card-header"><span class="card-project">' + esc(s.projectName) + '</span><span class="card-badges">' + agentBadge + '<span class="badge stopped">Done</span></span></div>'
-          + '<div class="card-title"><span class="card-title-text">' + esc(title) + '</span></div>'
-          + '<div class="card-bottom"><span class="card-device">' + esc(s.deviceName) + '</span><span class="card-time">' + timeAgo(s.lastActive) + '</span></div>'
-          + '</div>';
-      }).join('');
-      html += '</div></div>';
+    updateWidth();
+    if (window.ResizeObserver) {
+      recentTimeObserver = new ResizeObserver(updateWidth);
+      recentTimeObserver.observe(measure);
     }
-    var devs = (devData && devData.devices) || [];
-    if (devs.length) {
-      html += '<div class="section-title">Devices (' + devs.length + ')</div>';
-      html += '<div id="devices-section" class="list">';
-      html += devs.map(function (d) {
-        var rc = d.runningCount || 0, ic = d.needsInputCount || 0;
-        var dotClass = d.online ? 'online' : 'offline';
-        return '<div class="item" data-nav="device" data-name="' + esc(d.deviceName) + '">'
-          + '<div class="item-top"><span class="device-dot ' + dotClass + '"></span><span class="title">' + esc(d.deviceName) + '</span><span class="item-time">' + timeAgo(d.lastActive) + '</span></div>'
-          + '<div class="item-bottom"><span class="subtitle">' + osName(d.os) + ' &middot; ' + d.projectCount + ' projects</span><span class="item-status">' + rc + ' running &middot; ' + ic + ' needs input</span></div>'
-          + '</div>';
-      }).join('');
-      html += '</div>';
-    }
-    if (!html) html = '<div class="empty">No devices yet</div>';
-    content.innerHTML = html;
+  }
 
-    // Event delegation: route clicks through app.js once it's loaded; queue if not yet.
+  function moreProjectsControl() {
+    return '<button class="recent-projects-show-more' + (loadingRecentProjects ? ' recent-projects-loading' : '')
+      + '" type="button" data-show-more-projects' + (loadingRecentProjects ? ' disabled aria-busy="true"' : '') + '>'
+      + (loadingRecentProjects ? 'Loading…' : 'Show more') + '</button>';
+  }
+
+  function showMoreProjects() {
+    if (loadingRecentProjects) return;
+    var footer = document.getElementById('recent-projects-footer');
+    if (!footer) return;
+    var button = footer.querySelector('[data-show-more-projects]');
+    if (!button) return;
+    var previousMode = allRecentProjects;
+    var account = localStorage.getItem('_ak');
+    var accountServer = localStorage.getItem('_as');
+    var devices = homeDeviceData || (readCache() || {}).devices || { devices: [] };
+    allRecentProjects = true;
+    loadingRecentProjects = true;
+    button.textContent = 'Loading…';
+    button.disabled = true;
+    button.classList.add('recent-projects-loading');
+    button.setAttribute('aria-busy', 'true');
+    var activePromise = Promise.resolve().then(function () {
+      return window.api('/api/bridge/active-sessions', { allProjects: true });
+    }).then(function (data) {
+      if (!Array.isArray(data.recentProjects) || data.hasMoreProjects !== false) {
+        throw new Error('Incomplete project snapshot');
+      }
+      return data;
+    });
+    var run = loadHome(activePromise, Promise.resolve(devices), {
+      keepContent: true,
+      appendProjects: true,
+      isCurrent: function () {
+        return !!document.getElementById('recent-projects-section')
+          && localStorage.getItem('_ak') === account
+          && localStorage.getItem('_as') === accountServer;
+      }
+    });
+    var version = homeLoadVersion;
+    run.then(function (fresh) {
+      if (version !== homeLoadVersion) return;
+      loadingRecentProjects = false;
+      if (!fresh) {
+        allRecentProjects = previousMode;
+        var currentFooter = document.getElementById('recent-projects-footer');
+        if (currentFooter) currentFooter.innerHTML =
+          '<span class="recent-projects-error" role="alert">Unable to load more projects.</span>' + moreProjectsControl();
+      }
+    });
+  }
+
+  function bindHomeNavigation(content) {
+    if (content.__homeNavBound) return;
+    content.__homeNavBound = true;
     content.addEventListener('click', function (e) {
+      if (e.target.closest('[data-show-more-projects]')) {
+        if (typeof window.api === 'function') showMoreProjects();
+        else (window.__navQueue = window.__navQueue || []).push(showMoreProjects);
+        return;
+      }
+      var toggle = e.target.closest('[data-home-toggle]');
+      if (toggle) {
+        var panel = document.getElementById(toggle.getAttribute('aria-controls'));
+        if (!panel) return;
+        var expanded = toggle.getAttribute('aria-expanded') !== 'true';
+        toggle.setAttribute('aria-expanded', String(expanded));
+        panel.hidden = !expanded;
+        var key = toggle.dataset.homeToggle;
+        if (key === 'recent-projects') recentProjectsCollapsed = !expanded;
+        else if (key === 'devices') devicesCollapsed = !expanded;
+        else if (expanded) collapsedRecentProjects.delete(key);
+        else collapsedRecentProjects.add(key);
+        return;
+      }
       var t = e.target.closest('[data-nav]');
-      if (!t) return;
+      if (!t || e.ctrlKey || e.metaKey || e.shiftKey || e.altKey || e.button > 0) return;
+      e.preventDefault();
       var act = t.dataset.nav;
       var run = function () {
         if (act === 'device' && typeof window.loadProjects === 'function') window.loadProjects(t.dataset.name);
+        else if (act === 'project' && typeof window.loadSessions === 'function') window.loadSessions(t.dataset.device, t.dataset.phash, t.dataset.pname);
         else if (act === 'active' && typeof window.openActiveSession === 'function') window.openActiveSession(t);
       };
       if (typeof window.loadProjects === 'function') run();
       else (window.__navQueue = window.__navQueue || []).push(run);
     });
+  }
+
+  function restoreReturningHomePreview(snapshot) {
+    var returningFromSettings = !snapshot;
+    if (returningFromSettings) {
+      if (!window.__returningHome) return false;
+      if (window.__homePreviewRestored) return true;
+      try {
+        snapshot = JSON.parse(sessionStorage.getItem('baton-page-preview') || 'null');
+      } catch (e) {}
+    }
+    if (!snapshot || typeof snapshot.contentHtml !== 'string') return false;
+
+    var topBar = document.querySelector('body > .top-bar');
+    var breadcrumb = document.getElementById('breadcrumb');
+    var content = document.getElementById('content');
+    if (!topBar || !breadcrumb || !content) return false;
+
+    topBar.innerHTML = snapshot.topBarHtml || '';
+    breadcrumb.innerHTML = snapshot.breadcrumbHtml || '';
+    breadcrumb.style.display = snapshot.breadcrumbDisplay || 'none';
+    var preview = document.createElement('template');
+    preview.innerHTML = snapshot.contentHtml;
+    preview.content.querySelectorAll('img.runtime-icon').forEach(function (image) {
+      image.src = runtimeIconSource(image.closest('.runtime-mark-codex') ? 'codex' : 'claude');
+    });
+    content.replaceChildren(preview.content);
+    fitRecentTimeColumn();
+    content.scrollTop = snapshot.scrollTop || 0;
+    if (returningFromSettings) sessionStorage.removeItem('baton-page-preview');
+    bindHomeNavigation(content);
+    document.body.classList.add('ready');
+    window.__inlineRendered = true;
+    if (returningFromSettings) window.__homePreviewRestored = true;
+    markFirstWebFrameReady();
+    return true;
+  }
+  window.__restoreHomePreview = restoreReturningHomePreview;
+
+  function recentProjectHtml(project, index) {
+    var folderIcon = '<svg class="recent-project-icon" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">'
+      + '<g class="recent-folder-closed"><path d="M3 9V6a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v10a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V9Z"/><path d="M3 9h18"/></g>'
+      + '<g class="recent-folder-open"><path d="M3 18V6a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v1"/>'
+      + '<path d="M3 18 6 10.5Q6.6 9 8 9h11q2 0 2 2l-2 7.5Q18.5 20 17 20H5q-2 0-2-2Z"/></g></svg>';
+    var arrowIcon = '<svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" aria-hidden="true"><path d="m6 3 5 5-5 5"/></svg>';
+    var deviceLabel = (window.__deviceDisplayNames || {})[project.deviceName] || project.deviceName;
+    var projectHref = '#/' + encodeURIComponent(project.deviceName) + '/' + encodeURIComponent(project.projectHash);
+    var projectData = ' data-device="' + esc(project.deviceName) + '" data-phash="' + esc(project.projectHash) + '" data-pname="' + esc(project.projectName) + '"';
+    var projectKey = JSON.stringify([project.deviceName, project.projectHash]);
+    var collapsed = collapsedRecentProjects.has(projectKey);
+    var panelId = 'recent-project-sessions-' + index;
+    return '<section class="recent-project" aria-labelledby="recent-project-name-' + index + '">'
+      + '<div class="recent-project-header">'
+      + '<button class="recent-project-toggle" type="button" data-home-toggle="' + esc(projectKey) + '" aria-expanded="' + !collapsed + '" aria-controls="' + panelId + '">'
+      + folderIcon + '<span class="recent-project-context"><span class="recent-project-name" id="recent-project-name-' + index + '" title="' + esc(project.projectName) + '">' + esc(project.projectName) + '</span>'
+      + '<span class="recent-project-device" title="' + esc(deviceLabel) + '">' + esc(deviceLabel) + '</span></span></button>'
+      + '<a class="recent-project-link" href="' + esc(projectHref) + '" data-nav="project"' + projectData + '>'
+      + '<span class="recent-project-more">View all</span>' + arrowIcon + '</a></div>'
+      + '<div class="recent-project-sessions" id="' + panelId + '"' + (collapsed ? ' hidden' : '') + '>' + project.sessions.map(function (s) {
+        var title = s.isAgent && s.agentName ? s.agentName : attachmentPreviewText(s.preview || 'No preview');
+        var detail = s.status === 'needs_input' && s.agentDetail ? '\n' + s.agentDetail : '';
+        var label = s.status === 'running' ? 'Running' : s.status === 'needs_input' ? 'Needs input' : 'Done';
+        var statusClass = s.status === 'running' ? 'running' : s.status === 'needs_input' ? 'idle' : 'stopped';
+        var elapsed = timeAgo(s.lastActive);
+        var compactElapsed = elapsed === 'just now' ? 'now' : elapsed.replace(' ago', '');
+        return '<a class="recent-session" href="' + esc(projectHref + '/' + encodeURIComponent(s.sessionId)) + '" data-nav="active"' + projectData
+          + ' data-sid="' + esc(s.sessionId) + '" data-preview="' + esc(s.preview || '') + '" data-isagent="' + (s.isAgent ? 'true' : '') + '"'
+          + ' title="' + esc(title + detail) + '">'
+          + '<span class="recent-session-title">' + esc(title) + '</span>'
+          + '<span class="session-badges"><span class="badge recent-session-status ' + statusClass + '">' + label + '</span>'
+          + runtimeIcon(s) + '</span><time class="recent-session-time" datetime="' + esc(s.lastActive) + '" aria-label="' + esc(elapsed) + '">'
+          + '<span class="recent-session-time-full">' + elapsed + '</span>'
+          + '<span class="recent-session-time-short" aria-hidden="true">' + compactElapsed + '</span></time></a>';
+      }).join('') + '</div></section>';
+  }
+
+  function appendRecentProjects(fresh) {
+    var content = document.getElementById('content');
+    var footer = document.getElementById('recent-projects-footer');
+    var current = homeActiveData || (readCache() || {}).active;
+    if (!footer || !current) throw new Error('Home is no longer available');
+    var existing = current.recentProjects || [];
+    var seen = new Set(existing.map(function (p) { return JSON.stringify([p.deviceName, p.projectHash]); }));
+    var added = [];
+    fresh.recentProjects.forEach(function (p) {
+      var key = JSON.stringify([p.deviceName, p.projectHash]);
+      if (seen.has(key) || added.length >= 10 || existing.length + added.length >= 15) return;
+      seen.add(key);
+      added.push(p);
+    });
+    var keepScroll = content.scrollTop;
+    footer.insertAdjacentHTML('beforebegin', added.map(function (p, i) {
+      return recentProjectHtml(p, existing.length + i);
+    }).join(''));
+    footer.remove();
+    fitRecentTimeColumn();
+    content.scrollTop = keepScroll;
+    // Cache exactly what remains displayed; a normal home refresh replaces it
+    // with current activity and the latest project ordering.
+    homeActiveData = Object.assign({}, current, {
+      recentProjects: existing.concat(added), hasMoreProjects: false,
+    });
+    return homeActiveData;
+  }
+
+  function renderInline(activeData, devData) {
+    var content = document.getElementById('content');
+    if (!content) return;
+    homeActiveData = activeData;
+    homeDeviceData = devData;
+    var devs = (devData && devData.devices) || [];
+    var deviceDisplayNames = {};
+    devs.forEach(function (device) {
+      deviceDisplayNames[device.deviceName] = device.deviceDisplayName || device.deviceName;
+    });
+    window.__deviceDisplayNames = deviceDisplayNames;
+    var displayDeviceName = function (deviceName) {
+      return deviceDisplayNames[deviceName] || deviceName;
+    };
+    var html = '';
+    var collapseIcon = '<svg class="collapse-arrow" width="12" height="12" viewBox="0 0 16 16" aria-hidden="true"><path d="m6 3 5 5-5 5"/></svg>';
+    var actives = (activeData && activeData.sessions) || [];
+    if (actives.length) {
+      var activeCollapsible = actives.length > 10;
+      var activeCollapsed = activeCollapsible && sessionStorage.getItem('apeek_activeCollapsed') === '1';
+      html += '<div class="section-title active-section-heading' + (activeCollapsible ? ' collapsible' + (activeCollapsed ? '' : ' expanded') : '') + '"' + (activeCollapsible ? ' onclick="toggleActiveSessions()"' : '') + '>Active Sessions (' + actives.length + ')' + (activeCollapsible ? collapseIcon : '') + '</div>';
+      html += '<div id="active-section" class="active-grid" style="' + (activeCollapsed ? 'display:none' : '') + '">';
+      html += actives.map(function (s) {
+        var agentCount = Math.max(0, Number(s.agentCount) || 0);
+        var agentBadge = s.isAgent && !agentCount ? '<span class="badge agent">Agent</span>' : '';
+        var childAgentsBadge = agentCount ? '<span class="badge agent">' + agentCount + ' agent' + (agentCount === 1 ? '' : 's') + '</span>' : '';
+        var displayStatus = s.status;
+        var statusLabel = displayStatus === 'running' ? 'Running' : displayStatus === 'needs_input' ? 'Needs input' : 'Done';
+        var statusClass = displayStatus === 'running' ? 'running' : displayStatus === 'needs_input' ? 'idle' : 'stopped';
+        var title = s.isAgent && s.agentName ? s.agentName : attachmentPreviewText(s.preview || 'No preview');
+        var detail = s.status === 'needs_input' && s.agentDetail ? s.agentDetail : '';
+        return '<div class="active-card ' + esc(statusClass) + '"'
+          + ' data-nav="active"'
+          + ' data-sid="' + esc(s.sessionId) + '"'
+          + ' data-preview="' + esc(s.preview || '') + '"'
+          + ' data-device="' + esc(s.deviceName) + '"'
+          + ' data-phash="' + esc(s.projectHash) + '"'
+          + ' data-pname="' + esc(s.projectName) + '"'
+          + ' data-isagent="' + (s.isAgent ? 'true' : '') + '">'
+          + '<div class="card-header"><span class="card-project">' + esc(s.projectName) + '</span><span class="card-badges">' + agentBadge + childAgentsBadge + '<span class="badge ' + esc(statusClass) + '">' + statusLabel + '</span>' + runtimeIcon(s) + '</span></div>'
+          + '<div class="card-title"><span class="card-title-text">' + esc(title) + '</span>' + (detail ? '<span class="card-detail">' + esc(detail) + '</span>' : '') + '</div>'
+          + '<div class="card-bottom"><span class="card-device">' + esc(displayDeviceName(s.deviceName)) + '</span><span class="card-time">' + timeAgo(s.lastActive) + '</span></div>'
+          + '</div>';
+      }).join('');
+      html += '</div>';
+    }
+    var recentProjects = activeData && activeData.recentProjects;
+    if (Array.isArray(recentProjects)) {
+      var hasMoreProjects = activeData.hasMoreProjects || (!allRecentProjects && recentProjects.length > 5);
+      recentProjects = recentProjects.slice(0, allRecentProjects ? 15 : 5);
+      homeActiveData = Object.assign({}, activeData, { recentProjects: recentProjects, hasMoreProjects: hasMoreProjects });
+      html += '<section id="recent-projects-section" aria-labelledby="recent-projects-heading">'
+        + '<h2 class="section-title home-section-heading" id="recent-projects-heading">'
+        + '<button class="home-section-toggle recent-projects-toggle" type="button" data-home-toggle="recent-projects" aria-expanded="' + !recentProjectsCollapsed + '" aria-controls="recent-project-list">'
+        + 'Recent Projects' + collapseIcon + '</button></h2>'
+        + '<div class="recent-project-list" id="recent-project-list"' + (recentProjectsCollapsed ? ' hidden' : '') + '>';
+      html += recentProjects.map(recentProjectHtml).join('');
+      if (!recentProjects.length) html += '<p class="recent-projects-empty">No recent sessions yet</p>';
+      if (hasMoreProjects) html += '<div class="recent-projects-footer" id="recent-projects-footer">' + moreProjectsControl() + '</div>';
+      html += '</div></section>';
+    }
+    if (devs.length) {
+      html += '<section class="home-devices" aria-labelledby="devices-heading">'
+        + '<h2 class="section-title home-section-heading" id="devices-heading">'
+        + '<button class="home-section-toggle devices-toggle" type="button" data-home-toggle="devices" aria-expanded="' + !devicesCollapsed + '" aria-controls="devices-section">'
+        + 'Devices (' + devs.length + ')' + collapseIcon + '</button></h2>';
+      html += '<div id="devices-section" class="home-device-list"' + (devicesCollapsed ? ' hidden' : '') + '>';
+      html += devs.map(function (d) {
+        var rc = d.runningCount || 0, ic = d.needsInputCount || 0;
+        var dotClass = d.online ? 'online' : 'offline';
+        return '<a class="item device-item device-card" href="#/' + esc(encodeURIComponent(d.deviceName)) + '" data-nav="device" data-name="' + esc(d.deviceName) + '">'
+          + '<div class="item-top"><span class="device-dot ' + dotClass + '"></span><span class="title">' + esc(d.deviceDisplayName || d.deviceName) + '</span><span class="item-time">' + timeAgo(d.lastActive) + '</span></div>'
+          + '<div class="item-bottom"><span class="subtitle">' + osName(d.os) + ' &middot; ' + d.projectCount + ' projects</span><span class="item-status">' + rc + ' running &middot; ' + ic + ' needs input</span></div>'
+          + '</a>';
+      }).join('');
+      html += '</div></section>';
+    }
+    if (!html) html = '<div class="empty">No devices yet</div>';
+    content.innerHTML = html;
+    fitRecentTimeColumn();
+    if (window.__returningHome) document.body.classList.add('ready');
+    bindHomeNavigation(content);
 
     // Preheat viewer libs after 1.5s — yields IPC/main thread to navigation on Tauri.
     if (typeof window.loadViewerLibs === 'function') setTimeout(window.loadViewerLibs, 1500);
     else window.__preheatViewer = true;
 
     window.__inlineRendered = true;
+    markFirstWebFrameReady();
+  }
+
+  // Without cache, the Web skeleton mirrors the native launch layout.
+  function skelCard() {
+    return '<div class="active-card skeleton-card">'
+      + '<div class="card-header"><span class="skel skel-w40"></span><span class="skel skel-w16"></span></div>'
+      + '<div class="card-title"><span class="skel skel-w80 skel-h14"></span></div>'
+      + '<div class="card-bottom"><span class="skel skel-w24"></span><span class="skel skel-w16"></span></div>'
+      + '</div>';
+  }
+  function renderSkeleton(force) {
+    var content = document.getElementById('content');
+    if (!content || (window.__inlineRendered && !force)) return;
+    content.innerHTML = '<div class="section-title active-section-heading">Active Sessions</div>'
+      + '<div id="active-section" class="active-grid">' + skelCard() + skelCard() + '</div>'
+      + '<div class="section-title home-section-heading"><div class="home-section-toggle recent-projects-toggle">Recent Projects</div></div>'
+      + '<div class="recent-project-list" aria-hidden="true"><div class="recent-project">'
+      + '<div class="recent-project-header"><div class="recent-project-toggle"><span class="skel skel-w40"></span></div></div>'
+      + '<div class="recent-session"><span class="skel skel-w60"></span></div>'
+      + '<div class="recent-session"><span class="skel skel-w40"></span></div>'
+      + '<div class="recent-session"><span class="skel skel-w80"></span></div>'
+      + '<div class="recent-session"><span class="skel skel-w60"></span></div>'
+      + '<div class="recent-session"><span class="skel skel-w40"></span></div></div></div>';
+    if (document.body) document.body.classList.add('ready');
+    markFirstWebFrameReady();
   }
 
   // Wait for #content to be parsed, not DOMContentLoaded — avoids waiting for module chunks.
@@ -172,16 +577,98 @@
     }, 10);
   }
 
-  if (willRenderInline) {
-    Promise.all([window.__preload.active, window.__preload.devices]).then(function (results) {
-      whenContentReady(function () { renderInline(results[0], results[1]); });
+  whenContentReady(function () {
+    observeFirstWebFrame(document.getElementById('content'));
+  });
+
+  // Shared SWR path for both cold start and logo refresh.
+  function loadHome(activePromise, devicesPromise, options) {
+    options = options || {};
+    var version = ++homeLoadVersion;
+    if (!options.appendProjects) loadingRecentProjects = false;
+    var cached = readCache();
+    var hasCached = !!(cached && cached.active && cached.devices);
+    var usePagePreview = !options.resetScroll && !!window.__returningHome;
+    var isVisible = options.isCurrent || function () {
+      return !!document.querySelector('.top-gear');
+    };
+    var isCurrent = function () { return version === homeLoadVersion && isVisible(); };
+
+    setSync(true);
+    whenContentReady(function () {
+      if (!isCurrent()) return;
+      document.body.classList.add('browse-view');
+      setSync(true);
+      if (options.keepContent) return;
+      var restoredPreview = options.restoreSnapshot
+        ? restoreReturningHomePreview(options.restoreSnapshot)
+        : usePagePreview && (window.__homePreviewRestored || restoreReturningHomePreview());
+      if (restoredPreview) setSync(true);
+      if (!restoredPreview) {
+        if (hasCached) renderInline(cached.active, cached.devices);
+        else renderSkeleton(!!options.resetScroll);
+      }
+      if (options.resetScroll) document.getElementById('content').scrollTop = 0;
     });
+
+    var run = Promise.all([Promise.resolve(activePromise), Promise.resolve(devicesPromise)]).then(function (fresh) {
+      return new Promise(function (resolve, reject) {
+        whenContentReady(function () {
+          if (!isCurrent()) { resolve(fresh); return; }
+          if (!fresh[0] || !fresh[1]) { reject(new Error('Home refresh failed')); return; }
+          if (options.appendProjects) {
+            fresh[0] = appendRecentProjects(fresh[0]);
+          } else {
+            var freshRaw = JSON.stringify({ active: fresh[0], devices: fresh[1] });
+            var cachedRaw = hasCached ? JSON.stringify({ active: cached.active, devices: cached.devices }) : null;
+            if (!window.__inlineRendered || freshRaw !== cachedRaw) {
+              var content = document.getElementById('content');
+              var keepScroll = content ? content.scrollTop : 0;
+              renderInline(fresh[0], fresh[1]);
+              if (content) content.scrollTop = keepScroll;
+            }
+          }
+          writeCache(fresh[0], fresh[1]);
+          if (options.onFresh) options.onFresh(fresh[0], fresh[1]);
+          resolve(fresh);
+        });
+      });
+    }).catch(function () {
+      // Cache remains usable when revalidation fails.
+      return null;
+    }).then(function (fresh) {
+      if (isCurrent()) stopSync();
+      if (usePagePreview) {
+        window.__returningHome = false;
+        document.documentElement.classList.remove('returning-home');
+      }
+      return fresh;
+    });
+
+    window.__homeLoadPromise = run;
+    run.then(function () {
+      if (window.__homeLoadPromise === run) window.__homeLoadPromise = null;
+    });
+    return run;
+  }
+  window.__loadHome = loadHome;
+  window.__setTopSync = setSync;
+
+  if (willRenderInline) {
+    loadHome(window.__preload.active, window.__preload.devices);
+    window.__preload = null;
   } else {
+    // Deep links render their own skeleton in app.js. The observer releases the
+    // native overlay after that Web skeleton completes two layout frames.
+    whenContentReady(function () {
+      if (document.body) document.body.classList.add('ready');
+    });
     // Deep link: preheat immediately, user is heading to a message view.
     Promise.all([window.__preload.active, window.__preload.devices]).then(function () {
       if (typeof window.loadViewerLibs === 'function') window.loadViewerLibs();
       else window.__preheatViewer = true;
     });
+    stopSync(); // no home render here, but the gear was spinning from HTML — stop it
   }
 })();
 </script>
@@ -199,12 +686,12 @@
 </script>
 </head>
 <body>
-<script>if(window.__TAURI_INTERNALS__ && /Mac/.test(navigator.platform))document.body.classList.add('is-macos');</script>
+<script>if(/Mac/.test(navigator.platform)&&navigator.maxTouchPoints<2)document.body.classList.add('is-macos');</script>
 
 <!-- Top bar -->
 <div class="top-bar" data-tauri-drag-region onclick="document.getElementById('content').scrollTo({top:0,behavior:'smooth'})">
-  <div class="top-left" onclick="event.stopPropagation();loadDevices();" style="cursor:pointer">🔭 <span class="top-title">AgentPeek</span></div>
-  <div id="top-right" onclick="event.stopPropagation()"><a href="setup.html" class="top-gear" title="Settings"><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06A1.65 1.65 0 0 0 4.68 15a1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06A1.65 1.65 0 0 0 9 4.68a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06A1.65 1.65 0 0 0 19.4 9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg></a></div>
+  <div class="top-left" onclick="event.stopPropagation();loadDevices();" style="cursor:pointer"><span class="top-logo" aria-hidden="true"><img src="assets/baton-logo.svg" alt=""></span><span class="top-title">Baton</span></div>
+  <div id="top-right" onclick="event.stopPropagation()"><a href="setup.html" class="top-gear syncing" title="Settings"><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06A1.65 1.65 0 0 0 4.68 15a1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06A1.65 1.65 0 0 0 9 4.68a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06A1.65 1.65 0 0 0 19.4 9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg></a></div>
 </div>
 
 <!-- Breadcrumb -->
@@ -212,24 +699,24 @@
 
 <!-- Content area -->
 <div id="content"></div>
+<script>if(window.__restoreHomePreview)window.__restoreHomePreview();</script>
 
 <!-- Input bar -->
 <div id="input-bar" style="display:none">
+  <div id="file-drop-hint" role="status">Drop to attach</div>
   <div id="slash-popup" style="display:none">
     <div class="slash-popup-title">Slash Commands</div>
     <div id="slash-list"></div>
   </div>
   <div id="img-preview-row" style="display:none"></div>
   <div class="input-row">
-    <input type="file" id="img-picker" accept="image/*" multiple style="display:none" onchange="onImagePicked(this)" />
-    <button class="img-btn" onclick="document.getElementById('img-picker').click()" title="Add image">+</button>
+    <input type="file" id="img-picker" multiple style="display:none" onchange="onImagePicked(this)" />
+    <button class="img-btn" onclick="document.getElementById('img-picker').click()" title="Add files"><svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round"><path d="M12 5v14M5 12h14"/></svg></button>
     <textarea id="msg-input" rows="1" placeholder="Send a message..." onpaste="onInputPaste(event)"></textarea>
     <button id="mic-btn" class="mic-btn" style="display:none" onclick="toggleDictation()" title="Voice input"><svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="2" width="6" height="12" rx="3"/><path d="M5 10a7 7 0 0 0 14 0"/><line x1="12" y1="19" x2="12" y2="22"/></svg></button>
     <button id="send-btn" onclick="onSendBtnClick()"><svg viewBox="0 0 24 24" width="16" height="16"><rect x="6" y="6" width="12" height="12" rx="2" fill="currentColor"/></svg></button>
   </div>
 </div>
-
-<!-- Stats (removed, replaced by ws-banner) -->
 
 <!-- Scroll-to-bottom button -->
 <button id="scroll-bottom-btn" class="scroll-bottom-btn" onclick="scrollToBottom()">
@@ -239,10 +726,14 @@
 <!-- New Project modal -->
 <div id="newProjectModal" class="modal-overlay" style="display:none" onclick="if(event.target===this)closeNewProjectModal()">
   <div class="modal-box">
-    <div class="modal-title">New Project</div>
-    <div class="modal-desc">Enter directory name (relative to home) or full path</div>
-    <input id="newProjectInput" class="modal-input" type="text" placeholder="e.g. asset/demo" autocomplete="off" onkeydown="if(event.key==='Enter')submitNewProject();if(event.key==='Escape')closeNewProjectModal();" />
-    <label class="agent-toggle" style="margin-top:8px;justify-content:flex-start"><input type="checkbox" id="newProjectAsAgent"> Claude Agents Run in background</label>
+    <div class="modal-title">Project folder</div>
+    <div class="new-project-path">
+      <button id="newProjectUp" type="button" aria-label="Parent folder" title="Parent folder" onclick="newProjectParentDirectory()" disabled>
+        <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 19V5m-7 7 7-7 7 7"/></svg>
+      </button>
+      <input id="newProjectInput" class="modal-input" type="text" aria-label="Project folder path" placeholder="e.g. ~/asset/demo" autocomplete="off" autocapitalize="none" autocorrect="off" spellcheck="false" oninput="onNewProjectPathInput()" onkeydown="if(event.key==='Enter'){event.preventDefault();browseNewProjectPath();}if(event.key==='Escape')closeNewProjectModal();" />
+    </div>
+    <div id="newProjectDirectories" class="new-project-directories" aria-label="Folders"></div>
     <div class="modal-error" id="newProjectError"></div>
     <div class="modal-actions">
       <button class="modal-btn cancel" onclick="closeNewProjectModal()">Cancel</button>
@@ -266,8 +757,35 @@
   </div>
 </div>
 
+<!-- Codex writer takeover -->
+<div id="codexTakeoverModal" class="modal-overlay" style="display:none" onclick="if(event.target===this)closeCodexTakeoverModal()">
+  <div class="modal-box codex-takeover-box">
+    <div class="modal-title">Codex session is active</div>
+    <div class="modal-desc" id="codexTakeoverDesc"></div>
+    <div class="modal-error" id="codexTakeoverError"></div>
+    <div class="modal-actions">
+      <button class="modal-btn cancel" id="codexTakeoverCancel" onclick="closeCodexTakeoverModal()">Cancel send</button>
+      <button class="modal-btn confirm danger" id="codexTakeoverConfirm" onclick="confirmCodexTakeover()">Take over and send</button>
+    </div>
+  </div>
+</div>
+
+<div id="agentThreadsModal" class="modal-overlay agent-threads-overlay" style="display:none" onclick="if(event.target===this)closeAgentThreadsModal()">
+  <div class="modal-box agent-threads-box" role="dialog" aria-modal="true" aria-label="Subagents">
+    <div class="agent-threads-header">
+      <div class="modal-title">Subagents</div>
+      <button id="agentThreadsMain" class="agent-main-thread-btn" type="button"
+        aria-label="Return to main session" title="Return to main session"
+        onclick="switchAgentThread(this.dataset.sessionId)">Main Session</button>
+    </div>
+    <div id="agentThreadsList" class="agent-threads-list"></div>
+  </div>
+</div>
+
 <!-- Image overlay -->
-<div id="imgOverlay" class="img-overlay" style="display:none" onclick="this.style.display='none'">
+<div id="imgOverlay" class="img-overlay" style="display:none" role="dialog" aria-modal="true" aria-label="Image preview">
+  <button type="button" class="img-overlay-close" aria-label="Close image preview"><svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" aria-hidden="true"><path d="M6 6l12 12M18 6L6 18"/></svg></button>
+  <button type="button" class="file-download-action img-overlay-download" title="Download image" aria-label="Download image" hidden></button>
   <img id="imgOverlayImg" />
 </div>
 
@@ -275,12 +793,14 @@
 <div id="fileOverlay" class="file-overlay" style="display:none" onclick="if(event.target===this)closeFileViewer()">
   <div class="file-modal">
     <div class="file-modal-header">
+      <span id="fileBackButton" class="file-back-slot"></span>
       <span id="fileOverlayTitle" class="file-modal-title"></span>
+      <button type="button" id="file-download-btn" class="file-action file-download-action" onclick="downloadViewedFile()" title="Download file" aria-label="Download file"></button>
       <span id="fileOverlayTabs" class="file-tabs" style="display:none">
+        <button class="file-tab" data-mode="diff" style="display:none" onclick="setFileViewMode('diff')">Diff</button>
         <button class="file-tab active" data-mode="source" onclick="setFileViewMode('source')">Code</button>
         <button class="file-tab" data-mode="preview" onclick="setFileViewMode('preview')">Preview</button>
       </span>
-      <span class="file-modal-close" onclick="closeFileViewer()">×</span>
     </div>
     <div id="fileOverlayBody" class="file-modal-body"></div>
   </div>

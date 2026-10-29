@@ -3,9 +3,76 @@ import path from 'path';
 import os from 'os';
 import { execSync } from 'child_process';
 import { CLAUDE_PROJECTS, CLAUDE_JOBS, CLAUDE_DAEMON_ROSTER, IS_WSL, AGENTS_JSON_TTL_MS } from './config.mjs';
+import { scanJsonlLines } from './jsonl.mjs';
+import {
+  claudeLauncherError,
+  resolveClaudeBinForCapability,
+} from './runtime-capabilities.mjs';
+import { runExecutable } from './platform.mjs';
+import { attachmentPreviewText } from './attachments.mjs';
 
 // Mirrors CC's SKIP_FIRST_PROMPT_PATTERN (sessionStorage.ts).
 const SKIP_FIRST_PROMPT = /^(?:\s*<[a-z][\w-]*[\s>]|\[Request interrupted by user[^\]]*\])/;
+const claudeHistoryCache = new Map();
+const DEFAULT_CLAUDE_HISTORY = path.join(path.dirname(CLAUDE_PROJECTS), 'history.jsonl');
+const CLAUDE_SESSIONS = path.join(path.dirname(CLAUDE_PROJECTS), 'sessions');
+
+function previewText(value) {
+  const text = attachmentPreviewText(String(value || '')).replace(/\s+/g, ' ').trim();
+  if (!text) return '';
+  return text.length > 200 ? `${text.slice(0, 200).trim()}…` : text;
+}
+
+function commandPrompt(text) {
+  const command = /<command-name>\s*(\/?[^<]+?)\s*<\/command-name>/i.exec(text);
+  if (!command) return '';
+  const name = command[1].startsWith('/') ? command[1] : `/${command[1]}`;
+  const args = /<command-args>([\s\S]*?)<\/command-args>/i.exec(text)?.[1] || '';
+  return previewText(`${name}${args.trim() ? ` ${args.trim()}` : ''}`);
+}
+
+export function readClaudeFirstPrompts(historyPath) {
+  const prompts = new Map();
+  try {
+    scanJsonlLines(historyPath, (line) => {
+      if (!line.trim()) return;
+      let entry;
+      try {
+        entry = JSON.parse(line);
+      } catch {
+        return;
+      }
+      const sessionId = String(entry?.sessionId || '');
+      if (!sessionId || prompts.has(sessionId)) return;
+      const prompt = previewText(entry.display);
+      if (prompt) prompts.set(sessionId, prompt);
+    });
+  } catch (error) {
+    if (error?.code !== 'ENOENT') throw error;
+  }
+  return prompts;
+}
+
+export function getClaudeFirstPrompt(sessionId, historyPath) {
+  if (!sessionId || !historyPath) return '';
+  let stat;
+  try {
+    stat = fs.statSync(historyPath);
+  } catch {
+    claudeHistoryCache.delete(historyPath);
+    return '';
+  }
+  let cached = claudeHistoryCache.get(historyPath);
+  if (!cached || cached.size !== stat.size || cached.mtimeMs !== stat.mtimeMs) {
+    cached = {
+      size: stat.size,
+      mtimeMs: stat.mtimeMs,
+      prompts: readClaudeFirstPrompts(historyPath),
+    };
+    claudeHistoryCache.set(historyPath, cached);
+  }
+  return cached.prompts.get(sessionId) || '';
+}
 
 export function extractFirstPromptFromMsg(msg) {
   if (msg.type !== 'user' || msg.isMeta || msg.isCompactSummary) return '';
@@ -16,52 +83,70 @@ export function extractFirstPromptFromMsg(msg) {
   for (const raw of texts) {
     const t = raw.replace(/\n/g, ' ').trim();
     if (!t) continue;
+    const command = commandPrompt(raw);
+    if (command) return command;
     const bash = /<bash-input>([\s\S]*?)<\/bash-input>/.exec(t);
     if (bash) return `! ${bash[1].trim()}`;
     if (SKIP_FIRST_PROMPT.test(t)) continue;
-    return t.length > 200 ? t.slice(0, 200).trim() + '…' : t;
+    return previewText(t);
   }
   return '';
 }
 
-export function getPreview(filePath) {
+export function getSessionMetadata(filePath, options = {}) {
   try {
-    const lines = fs.readFileSync(filePath, 'utf-8').trim().split('\n');
     let customTitle = '';
     let aiTitle = '';
+    let summary = '';
     let lastPrompt = '';
     let firstUserMsg = '';
+    let firstPromptLine = -1;
+    let model = '';
+    let status = null;
 
-    for (const line of lines) {
-      if (!line.trim()) continue;
+    const lineCount = scanJsonlLines(filePath, (line, index) => {
+      if (!line.trim()) return;
       try {
         const msg = JSON.parse(line);
         if (msg.type === 'custom-title' && msg.customTitle) customTitle = msg.customTitle;
         if (msg.type === 'ai-title' && msg.aiTitle) aiTitle = msg.aiTitle;
+        if (msg.type === 'summary' && msg.summary) summary = msg.summary;
         if (msg.type === 'last-prompt' && msg.lastPrompt) lastPrompt = msg.lastPrompt;
         if (!firstUserMsg) {
           const fp = extractFirstPromptFromMsg(msg);
-          if (fp) firstUserMsg = fp;
+          if (fp) {
+            firstUserMsg = fp;
+            firstPromptLine = index;
+          }
         }
+        if (msg.type === 'assistant' && msg.message?.model) model = msg.message.model;
+        if (options.includeStatus) status = statusFromEntry(msg) || status;
       } catch {}
-    }
-    return customTitle || aiTitle || lastPrompt || firstUserMsg;
+    });
+    const sessionId = path.basename(filePath, '.jsonl');
+    const hasFirstPrompt = Object.prototype.hasOwnProperty.call(options, 'firstPrompt');
+    const indexedFirstPrompt = !hasFirstPrompt
+      ? getClaudeFirstPrompt(
+        sessionId,
+        options.historyPath || DEFAULT_CLAUDE_HISTORY,
+      )
+      : previewText(options.firstPrompt);
+    return {
+      preview: previewText(
+        customTitle
+        || aiTitle
+        || summary
+        || indexedFirstPrompt
+        || firstUserMsg
+        || lastPrompt,
+      ),
+      model,
+      lineCount,
+      ...(options.includeFirstPromptLine ? { firstPromptLine } : {}),
+      ...(options.includeStatus ? { status } : {}),
+    };
   } catch {}
-  return '';
-}
-
-export function getModel(filePath) {
-  try {
-    const lines = fs.readFileSync(filePath, 'utf-8').trim().split('\n');
-    for (let i = lines.length - 1; i >= 0; i--) {
-      if (!lines[i].trim()) continue;
-      try {
-        const msg = JSON.parse(lines[i]);
-        if (msg.type === 'assistant' && msg.message?.model) return msg.message.model;
-      } catch {}
-    }
-  } catch {}
-  return '';
+  return { preview: '', model: '', lineCount: 0 };
 }
 
 // Forward-hash a real path segment the way CC does when building a project hash:
@@ -94,7 +179,7 @@ export function matchRealSegment(currentDir, parts, i) {
 /**
  * Resolve projectHash back to an absolute directory path.
  * Hash rule: path.resolve(cwd).replace(/[^a-zA-Z0-9-]/g, '-')
- * e.g. "-Users-xiaoweii-workspace-rn-agentpeek" → "/Users/xiaoweii/workspace/rn/agentpeek"
+ * e.g. "-Users-xiaoweii-workspace-rn-baton" → "/Users/xiaoweii/workspace/rn/baton"
  *
  * Windows CC generates hashes like "C-Users-Admin-workspace-project" (drive letter prefix).
  * On WSL, we map these to /mnt/c/Users/Admin/workspace/project.
@@ -103,18 +188,19 @@ export function projectHashToPath(projectHash) {
   const homeDir = os.homedir();
   const homeHash = path.resolve(homeDir).replace(/[^a-zA-Z0-9-]/g, '-');
   let remaining = projectHash;
-  let currentDir = '/';
+  let currentDir = path.parse(homeDir).root;
 
-  // Windows hash detection: starts with single uppercase letter (drive letter)
-  // e.g. "C-Users-Admin-workspace" → /mnt/c/Users/Admin/workspace (on WSL)
-  const winDriveMatch = projectHash.match(/^([A-Z])-/);
-  if (winDriveMatch && process.env.WSL_DISTRO_NAME) {
-    const drive = winDriveMatch[1].toLowerCase();
-    currentDir = `/mnt/${drive}`;
-    remaining = projectHash.slice(2); // remove "C-"
-  } else if (remaining.startsWith(homeHash)) {
+  const winDriveMatch = projectHash.match(/^([A-Z])--?/);
+  if (remaining.startsWith(homeHash)) {
     remaining = remaining.slice(homeHash.length).replace(/^-/, '');
     currentDir = homeDir;
+  } else if (winDriveMatch && process.platform === 'win32') {
+    currentDir = `${winDriveMatch[1]}:\\`;
+    remaining = projectHash.slice(winDriveMatch[0].length);
+  } else if (winDriveMatch && process.env.WSL_DISTRO_NAME) {
+    const drive = winDriveMatch[1].toLowerCase();
+    currentDir = `/mnt/${drive}`;
+    remaining = projectHash.slice(winDriveMatch[0].length);
   } else {
     remaining = remaining.replace(/^-/, '');
   }
@@ -143,16 +229,17 @@ export function readableProjectName(projectHash) {
   let currentDir = os.homedir();
   const segments = [];
 
-  // Windows hash on WSL: "C-Users-Admin-workspace" → resolve via /mnt/c/
-  const winDriveMatch = projectHash.match(/^([A-Z])-/);
-  if (winDriveMatch && process.env.WSL_DISTRO_NAME) {
+  const winDriveMatch = projectHash.match(/^([A-Z])--?/);
+  if (remaining.startsWith(homeHash)) {
+    remaining = remaining.slice(homeHash.length).replace(/^-/, '');
+    if (!remaining) return '~';
+  } else if (winDriveMatch && process.platform === 'win32') {
+    currentDir = `${winDriveMatch[1]}:\\`;
+    remaining = projectHash.slice(winDriveMatch[0].length);
+  } else if (winDriveMatch && process.env.WSL_DISTRO_NAME) {
     const drive = winDriveMatch[1].toLowerCase();
     currentDir = `/mnt/${drive}`;
-    remaining = projectHash.slice(2);
-  } else if (remaining.startsWith(homeHash)) {
-    remaining = remaining.slice(homeHash.length);
-    remaining = remaining.replace(/^-/, '');
-    if (!remaining) return '~';
+    remaining = projectHash.slice(winDriveMatch[0].length);
   } else {
     remaining = remaining.replace(/^-/, '');
   }
@@ -177,9 +264,10 @@ export function readableProjectName(projectHash) {
 
 /**
  * Determine session status from CC process state + jsonl content.
- * Returns "running" | "completed" (external sessions can't observe needs_input).
+ * Returns "running" | "needs_input" | "completed".
  *
  * - running: CC process on this session + jsonl shows active work
+ * - needs_input: structured AskUserQuestion/ExitPlanMode tool use
  * - completed: finished turn, no process, or stale file
  *
  * @param {string} sessionId - the session UUID
@@ -195,6 +283,11 @@ export function statusFromEntry(entry) {
   // last-prompt is a metadata snapshot CC re-appends near EOF (not a state signal),
   // so it's not turn-defining → keep scanning. (CC source: sessionStorage.ts.)
   if (t === 'assistant' && entry.message) {
+    const content = entry.message.content;
+    if (Array.isArray(content) && content.some((b) =>
+      b.type === 'tool_use' && (b.name === 'AskUserQuestion' || b.name === 'ExitPlanMode'))) {
+      return 'needs_input';
+    }
     const sr = entry.message.stop_reason;
     if (sr === null) return 'running'; // streaming
     if (sr === 'tool_use') return 'running';
@@ -220,22 +313,10 @@ export function statusFromEntry(entry) {
     }
     return 'running';
   }
+  // Newer CC writes forked-skill output as a system row instead of a user row.
+  if (t === 'system' && entry.subtype === 'local_command'
+    && /^<local-command-stdout>/.test(entry.content || '')) return 'completed';
   return null; // file-history-snapshot, queue-operation, etc.
-}
-
-// Last time content judged each session 'running' — for the downgrade debounce.
-const lastRunningTs = new Map();
-const RUNNING_DEBOUNCE_MS = 10_000;
-
-// Hold 'running' across end_turn flicker before downgrading to the terminal 'completed'.
-export function resolveStatus(sessionId, contentStatus) {
-  if (contentStatus === 'running') {
-    lastRunningTs.set(sessionId, Date.now());
-    return 'running';
-  }
-  const last = lastRunningTs.get(sessionId);
-  if (last && Date.now() - last < RUNNING_DEBOUNCE_MS) return 'running';
-  return 'completed';
 }
 
 /**
@@ -286,11 +367,14 @@ function readStatusFromFile(filePath) {
  * Watcher uses statusFromEntry() directly with already-parsed data.
  */
 export function getSessionStatus(sessionId, filePath, runningInfo) {
-  // WSL monitoring Windows CC: can't detect processes, use mtime + content only
-  const wslMode = IS_WSL && CLAUDE_PROJECTS.startsWith('/mnt/');
+  const live = runningInfo.liveStatuses?.get(sessionId);
+  if (live) return live;
 
-  // 1. No CC process for this project → completed (skip on WSL)
-  if (!wslMode && !runningInfo.sessions.has(sessionId)) {
+  const metadataOnly = process.platform === 'win32'
+    || (IS_WSL && CLAUDE_PROJECTS.startsWith('/mnt/'));
+
+  // 1. No CC process for this project → completed (skip where cwd inspection is unavailable)
+  if (!metadataOnly && !runningInfo.sessions.has(sessionId)) {
     const projectHash = path.basename(path.dirname(filePath));
     if (!runningInfo.projects.has(projectHash)) return 'completed';
     if (runningInfo.sessions.size > 0) return 'completed';
@@ -305,14 +389,18 @@ export function getSessionStatus(sessionId, filePath, runningInfo) {
   try { mtimeMs = fs.statSync(filePath).mtimeMs; } catch { return 'completed'; }
   if (!runningInfo.sessions.has(sessionId) && Date.now() - mtimeMs > 300_000) return 'completed';
 
-  // 4. Debounce before downgrading running→completed.
-  return resolveStatus(sessionId, contentStatus);
+  return contentStatus;
+}
+
+// Existing sessions run with --resume; Bridge-created ones with --session-id.
+export function sessionIdFromProcessArgs(line) {
+  return line.match(/--(?:resume|session-id)\s+([0-9a-f-]{36})/)?.[1] || null;
 }
 
 /**
  * Detect running CC processes. Returns { projects: Set<hash>, sessions: Set<sessionId> }
  * - projects: project directory hashes with active CC processes
- * - sessions: exact session IDs extracted from --resume args
+ * - sessions: exact session IDs extracted from --resume / --session-id args
  *
  * On WSL watching /mnt/ paths: Windows CC processes are invisible to Linux ps,
  * so we return empty sets and rely on mtime heuristic (same as VS Code CC).
@@ -320,9 +408,9 @@ export function getSessionStatus(sessionId, filePath, runningInfo) {
 export function getRunningInfo() {
   const projects = new Set();
   const sessions = new Set();
+  const pids = new Set();
 
-  // WSL bridge monitoring Windows CC: can't see Windows processes, use mtime fallback
-  if (IS_WSL && CLAUDE_PROJECTS.startsWith('/mnt/')) {
+  if (process.platform === 'win32' || (IS_WSL && CLAUDE_PROJECTS.startsWith('/mnt/'))) {
     return { projects, sessions };
   }
 
@@ -333,10 +421,10 @@ export function getRunningInfo() {
       const parts = line.trim().split(/\s+/);
       const pid = parts[1];
       if (!pid || isNaN(pid)) continue;
+      pids.add(pid);
 
-      // Extract --resume sessionId from process args
-      const resumeMatch = line.match(/--resume\s+([0-9a-f-]{36})/);
-      if (resumeMatch) sessions.add(resumeMatch[1]);
+      const sid = sessionIdFromProcessArgs(line);
+      if (sid) sessions.add(sid);
 
       try {
         const cwd = process.platform === 'darwin'
@@ -351,14 +439,46 @@ export function getRunningInfo() {
     sessions.add(sid);
   }
 
-  return { projects, sessions };
+  return { projects, sessions, liveStatuses: readLiveSessionStatuses(pids) };
+}
+
+const LIVE_STATUS = { busy: 'running', waiting: 'needs_input', idle: 'completed', shell: 'completed' };
+
+// CC keeps ~/.claude/sessions/<pid>.json at its own busy/waiting/idle state (terminal
+// since 2.1.119, SDK/VS Code since 2.1.269). A killed process leaves its record behind,
+// so only records of a listed claude pid count, and on Linux only the same process start.
+export function readLiveSessionStatuses(claudePids, dir = CLAUDE_SESSIONS) {
+  const statuses = new Map();
+  let files;
+  try { files = fs.readdirSync(dir); } catch { return statuses; }
+  for (const file of files) {
+    const pid = /^(\d+)\.json$/.exec(file)?.[1];
+    if (!pid || !claudePids.has(pid)) continue;
+    try {
+      const record = JSON.parse(fs.readFileSync(path.join(dir, file), 'utf8'));
+      const status = LIVE_STATUS[record.status];
+      if (!record.sessionId || !status) continue;
+      if (process.platform === 'linux' && record.procStart !== undefined
+        && processStartTime(pid) !== String(record.procStart)) continue;
+      if (status !== 'completed' || !statuses.has(record.sessionId)) {
+        statuses.set(record.sessionId, status);
+      }
+    } catch {}
+  }
+  return statuses;
+}
+
+// Field 22 of /proc/<pid>/stat; the comm field before it may contain spaces.
+function processStartTime(pid) {
+  const stat = fs.readFileSync(`/proc/${pid}/stat`, 'utf8');
+  return stat.slice(stat.lastIndexOf(')') + 2).split(' ')[19];
 }
 
 // A session that cd's into a git worktree gets its jsonl moved to a separate
 // project dir (parentHash + "--claude-worktrees-<name>"), producing a second
 // DDB row for the same sessionId. Collapse worktree hashes to the parent so one
 // session stays one row. Applied only to the projectHash POSTed to the server —
-// on-disk reads (findSessionFile/getPreview/projectHashToPath) keep the real hash.
+// on-disk reads (findSessionFile/getSessionMetadata/projectHashToPath) keep the real hash.
 export function normalizeProjectHash(hash) {
   return hash.replace(/--claude-worktrees-.*$/, '');
 }
@@ -401,24 +521,39 @@ export function agentDetailFor(a) {
 let _claudeBin;
 export function resolveClaudeBin() {
   if (_claudeBin !== undefined) return _claudeBin;
-  const candidates = [
-    path.join(os.homedir(), '.local/bin/claude'),
-    '/usr/local/bin/claude',
-    '/opt/homebrew/bin/claude',
-    '/usr/bin/claude',
-  ];
-  for (const c of candidates) {
-    try { if (fs.existsSync(c)) { _claudeBin = c; return c; } } catch {}
-  }
-  _claudeBin = null; // fall back to `bash -lc` in getAgentsJson
-  return null;
+  _claudeBin = resolveClaudeBinForCapability();
+  return _claudeBin;
+}
+
+export function requireClaudeBin() {
+  const binary = resolveClaudeBin();
+  if (binary) return binary;
+  throw claudeLauncherError();
 }
 
 let _agentsCache = { at: 0, map: new Map() };
-// `claude agents --json --all` → Map<sessionId, {isAgent, agentName, agentDetail,
-// status}>. Daemon-live source of truth, cached briefly (AGENTS_JSON_TTL_MS)
-// since sync/watcher call this per session. On any failure, returns the last
-// good cache (never an empty map that would flap every agent to stopped).
+export function resolveAgentMetadata(a, context = {}) {
+  const sessionId = a.sessionId || '';
+  const daemonActive = context.daemonActive === true;
+  const runningInfo = context.runningInfo || { projects: new Set(), sessions: new Set() };
+  const status = daemonActive
+    ? mapAgentState(a)
+    : context.filePath
+      ? getSessionStatus(sessionId, context.filePath, runningInfo)
+      : 'completed';
+  const detail = daemonActive && status === 'needs_input'
+    ? (context.agentDetail === undefined ? agentDetailFor(a) : context.agentDetail)
+    : '';
+  return {
+    isAgent: true,
+    agentName: a.name || '',
+    agentDetail: detail,
+    status,
+  };
+}
+
+// --all preserves identity; only roster-owned workers trust its state.
+// Inactive agents fall back to process + jsonl status.
 export function getAgentsJson(force) {
   const now = Date.now();
   if (!force && now - _agentsCache.at < AGENTS_JSON_TTL_MS) return _agentsCache.map;
@@ -426,12 +561,14 @@ export function getAgentsJson(force) {
   let out;
   try {
     out = bin
-      ? execSync(`"${bin}" agents --json --all`, { encoding: 'utf-8', timeout: 15000, stdio: ['ignore', 'pipe', 'ignore'] })
+      ? runExecutable(bin, ['agents', '--json', '--all'], { encoding: 'utf-8', timeout: 15000, stdio: ['ignore', 'pipe', 'ignore'] })
       : execSync(`bash -lc 'claude agents --json --all'`, { encoding: 'utf-8', timeout: 15000, stdio: ['ignore', 'pipe', 'ignore'] });
   } catch { return _agentsCache.map; }
   let arr;
   try { arr = JSON.parse(out); } catch { return _agentsCache.map; }
   if (!Array.isArray(arr)) return _agentsCache.map;
+  const daemonRunning = getDaemonRunningSessionIds();
+  let runningInfo = null;
   const map = new Map();
   for (const a of arr) {
     if (!a || !a.sessionId) continue;
@@ -439,12 +576,14 @@ export function getAgentsJson(force) {
     // `state` field). Only kind:"background" are real daemon agents; the rest
     // must not be tagged isAgent (they'd show as bogus "Working" agents).
     if (a.kind !== 'background') continue;
-    map.set(a.sessionId, {
-      isAgent: true,
-      agentName: a.name || '',
-      agentDetail: agentDetailFor(a),
-      status: mapAgentState(a),
-    });
+    const daemonActive = daemonRunning.has(a.sessionId);
+    const filePath = daemonActive ? null : findSessionFile(a.sessionId);
+    if (!daemonActive && filePath && !runningInfo) runningInfo = getRunningInfo();
+    map.set(a.sessionId, resolveAgentMetadata(a, {
+      daemonActive,
+      filePath,
+      runningInfo,
+    }));
   }
   _agentsCache = { at: now, map };
   return map;

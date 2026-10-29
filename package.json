@@ -1,11 +1,19 @@
 {
-  "name": "agentpeek",
-  "version": "0.2.0",
+  "name": "baton",
+  "version": "1.0.0",
   "private": true,
   "license": "MIT",
   "scripts": {
     "dev": "vite",
     "build": "vite build",
+    "test": "npm run test:bridge && npm run test:codex && npm run test:frontend && npm run test:server && npm run test:packaging",
+    "test:bridge": "node --test test/bridge/*.test.mjs",
+    "test:codex": "node --test test/codex/phase1/*.test.mjs test/codex/phase2/*.test.mjs test/codex/phase3/*.test.mjs",
+    "test:codex:e2e": "node test/codex/phase2/e2e.mjs --run",
+    "test:codex:stress": "node test/codex/phase2/parcel-stress.mjs --run",
+    "test:frontend": "node --test test/frontend/*.test.mjs",
+    "test:server": "python3 -m pytest test/server",
+    "test:packaging": "node --test test/packaging/*.test.mjs",
     "preview": "vite preview",
     "tauri": "tauri",
     "tauri:dev": "tauri dev",
@@ -14,21 +22,39 @@
     "dev:ios": "tauri ios dev \"iPhone 17 Pro\"",
     "build:ios": "tauri ios build",
     "release:ios": "./scripts/release-ios.sh",
+    "release:ios:cloud": "node scripts/release-ios-cloud.mjs",
     "build:mac": "./scripts/release-mac.sh",
-    "build:windows": "./scripts/release-windows.sh"
+    "build:windows": "./scripts/release-windows.sh",
+    "package": "bash scripts/package-all.sh",
+    "package:android": "node scripts/package-cloud.mjs --platform android",
+    "package:macos": "node scripts/package-cloud.mjs --platform macos",
+    "package:windows": "node scripts/package-cloud.mjs --platform windows",
+    "package:dev:android": "node scripts/package-cloud.mjs --dev --platform android",
+    "package:dev:ios": "node scripts/package-cloud.mjs --dev --platform ios",
+    "package:dev:macos": "node scripts/package-cloud.mjs --dev --platform macos",
+    "package:dev:windows": "node scripts/package-cloud.mjs --dev --platform windows"
   },
   "dependencies": {
+    "@tauri-apps/api": "^2.11.0",
     "@tauri-apps/plugin-barcode-scanner": "^2.4.4",
     "@tauri-apps/plugin-opener": "^2.2.6",
+    "@xterm/addon-fit": "0.12.0-beta.301",
+    "@xterm/xterm": "6.1.0-beta.304",
     "anser": "^2.3.5",
     "diff": "^5.2.0",
     "diff2html": "^3.4.51",
+    "dompurify": "^3.4.17",
+    "hash-wasm": "^4.12.0",
     "highlight.js": "^11.9.0",
+    "lucide": "1.47.0",
     "marked": "^12.0.1",
-    "qrcode-generator": "^1.4.4"
+    "qrcode-generator": "^1.4.4",
+    "ws": "^8.21.3"
   },
   "devDependencies": {
     "@tauri-apps/cli": "^2.11.0",
+    "gemoji": "^8.1.0",
+    "jsdom": "^29.1.1",
     "vite": "^5.4.10"
   }
 }

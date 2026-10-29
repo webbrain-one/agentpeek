@@ -19,7 +19,7 @@ What it does:
 Safe to re-run: idempotent (already-migrated items are skipped).
 
 Usage:
-  python3 migrate-sessions-table.py --table AgentPeekTest-bridge-sessions --region us-west-2
+  python3 migrate-sessions-table.py --table Baton-bridge-sessions --region us-west-2
   python3 migrate-sessions-table.py ... --dry-run
 """
 
@@ -84,6 +84,8 @@ def main():
         new_item = dict(it)
         new_item["sk"] = f"SESS#{device}#{project}#{session_id}"
         new_item["entityType"] = "session"
+        new_item["listPk"] = f"{account_id}#SESS#{device}#{project}"
+        new_item["listSk"] = f"{it.get('lastActive', '') or '0000'}#{session_id}"
         sess_writes.append(new_item)
         old_deletes.append({"accountId": account_id, "sk": sk})
 
@@ -184,6 +186,8 @@ def main():
                 "runningCount": p["runningCount"],
                 "idleCount": p["idleCount"],
                 "lastActive": p["lastActive"],
+                "listPk": f"{acc}#PROJ#{dev}",
+                "listSk": f"{p['lastActive'] or '0000'}#{proj}",
                 "updatedAt": now,
             })
 

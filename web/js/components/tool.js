@@ -1,11 +1,214 @@
+import { state } from '../state.js';
+import { loadingSpinner } from './loading.js';
+import { observeToolDetails, loadToolDetails, toolDetailsSource } from '../tool-details.js';
+
 // Tool rendering: Bash, Read, Edit, Write, Grep, Glob, etc.
 (function () {
   // On cancel, the bridge denies the ask/plan with interrupt:true; CC overwrites the tool_result with this rejection text.
   var CANCEL_MARK = 'tool use was rejected';
+  const CODEX_TOOL_NAMES = {
+    Read: 'Explored',
+    Grep: 'Explored',
+    Glob: 'Explored',
+    Edit: 'Edited',
+    Write: 'Edited',
+    TodoWrite: 'Updated Plan',
+    ViewImage: 'Viewed Image',
+    ToolSearch: 'Searched Tools',
+    WebSearch: 'Searched the web',
+    get_goal: 'Checked Goal',
+    spawn_agent: 'Spawned Agent',
+    send_input: 'Sent Agent Input',
+    wait_agent: 'Waited for Agent',
+    close_agent: 'Closed Agent',
+    request_user_input: 'Requested Input',
+    Agent: 'Ran Agent',
+    WriteStdin: 'Ran',
+  };
   function esc(str) {
     if (!str) return '';
     return String(str).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
   }
+
+  const SHELL_HIGHLIGHT_CACHE_LIMIT = 256;
+  const SHELL_HIGHLIGHT_MAX_CHARS = 1024;
+  const READ_HIGHLIGHT_CACHE_LIMIT = 64;
+  const READ_HIGHLIGHT_MAX_CHARS = 128 * 1024;
+  const shellHighlightCache = new Map();
+  const readHighlightCache = new Map();
+  const shellKeywords = new Set([
+    'case', 'do', 'done', 'elif', 'else', 'esac', 'fi', 'for', 'function',
+    'if', 'in', 'select', 'then', 'time', 'until', 'while',
+  ]);
+
+  function shellToken(kind, text) {
+    return `<span class="shell-token shell-${kind}">${esc(text)}</span>`;
+  }
+
+  function shellOperatorAt(source, index) {
+    const three = source.slice(index, index + 3);
+    if (three === '<<<' || three === '<<-' || three === ';;&') return three;
+    const two = source.slice(index, index + 2);
+    if (['&&', '||', '<<', '>>', '|&', ';;', ';&', '>&', '<&', '>|'].includes(two)) return two;
+    return '|;&><()'.includes(source[index]) ? source[index] : '';
+  }
+
+  function readQuotedShellToken(source, start) {
+    const quote = source[start];
+    let index = start + 1;
+    while (index < source.length) {
+      if (source[index] === '\\' && quote === '"' && index + 1 < source.length) {
+        index += 2;
+        continue;
+      }
+      if (source[index] === quote) {
+        index++;
+        break;
+      }
+      index++;
+    }
+    return index;
+  }
+
+  function readShellVariable(source, start) {
+    if (source[start + 1] === '{') {
+      const end = source.indexOf('}', start + 2);
+      return end === -1 ? source.length : end + 1;
+    }
+    if (source[start + 1] === '(') return Math.min(start + 2, source.length);
+    let index = start + 1;
+    while (index < source.length && /[A-Za-z0-9_?!#$*@-]/.test(source[index])) index++;
+    return index === start + 1 ? start + 1 : index;
+  }
+
+  function heredocEnd(source, start, delimiter) {
+    let lineStart = start;
+    while (lineStart <= source.length) {
+      const newline = source.indexOf('\n', lineStart);
+      const lineEnd = newline === -1 ? source.length : newline;
+      if (source.slice(lineStart, lineEnd).trim() === delimiter) {
+        return { bodyEnd: lineStart, delimiterEnd: lineEnd };
+      }
+      if (newline === -1) break;
+      lineStart = newline + 1;
+    }
+    return null;
+  }
+
+  // Lightweight shell highlighting for compact tool rows. It recognizes syntax
+  // positions rather than executable names, so new CLIs work without a command catalog.
+  function highlightShellCommand(command) {
+    const source = String(command || '');
+    if (!source) return '';
+    if (shellHighlightCache.has(source)) {
+      const cached = shellHighlightCache.get(source);
+      shellHighlightCache.delete(source);
+      shellHighlightCache.set(source, cached);
+      return cached;
+    }
+    if (source.length > SHELL_HIGHLIGHT_MAX_CHARS) {
+      return esc(source);
+    }
+
+    let html = '';
+    let index = 0;
+    let expectsCommand = true;
+    let expectsHeredocDelimiter = false;
+    let pendingHeredoc = '';
+    while (index < source.length) {
+      const char = source[index];
+      if (char === '\n') {
+        html += '\n';
+        index++;
+        expectsCommand = true;
+        if (pendingHeredoc) {
+          const end = heredocEnd(source, index, pendingHeredoc);
+          if (end) {
+            html += shellToken('string', source.slice(index, end.bodyEnd));
+            html += shellToken('heredoc', source.slice(end.bodyEnd, end.delimiterEnd));
+            index = end.delimiterEnd;
+          }
+          pendingHeredoc = '';
+        }
+        continue;
+      }
+      if (/\s/.test(char)) {
+        let end = index + 1;
+        while (end < source.length && source[end] !== '\n' && /\s/.test(source[end])) end++;
+        html += esc(source.slice(index, end));
+        index = end;
+        continue;
+      }
+      if (char === '#' && (index === 0 || /\s/.test(source[index - 1]))) {
+        const end = source.indexOf('\n', index);
+        const commentEnd = end === -1 ? source.length : end;
+        html += shellToken('comment', source.slice(index, commentEnd));
+        index = commentEnd;
+        continue;
+      }
+      if (char === '"' || char === "'") {
+        const end = readQuotedShellToken(source, index);
+        const token = source.slice(index, end);
+        html += shellToken(expectsHeredocDelimiter ? 'heredoc' : 'string', token);
+        if (expectsHeredocDelimiter) {
+          pendingHeredoc = token.slice(1, token.endsWith(char) ? -1 : undefined);
+          expectsHeredocDelimiter = false;
+        }
+        index = end;
+        continue;
+      }
+      if (char === '$') {
+        const end = readShellVariable(source, index);
+        html += shellToken('variable', source.slice(index, end));
+        index = end;
+        continue;
+      }
+      const operator = shellOperatorAt(source, index);
+      if (operator) {
+        html += shellToken('operator', operator);
+        index += operator.length;
+        expectsHeredocDelimiter = operator === '<<' || operator === '<<-';
+        if (['&&', '||', '|', '|&', ';', '&', '('].includes(operator)) expectsCommand = true;
+        continue;
+      }
+
+      let end = index + 1;
+      while (end < source.length
+        && !/\s/.test(source[end])
+        && source[end] !== '"'
+        && source[end] !== "'"
+        && source[end] !== '$'
+        && !shellOperatorAt(source, end)) {
+        end++;
+      }
+      const token = source.slice(index, end);
+      let kind = '';
+      if (expectsHeredocDelimiter) {
+        kind = 'heredoc';
+        pendingHeredoc = token;
+        expectsHeredocDelimiter = false;
+      } else if (/^--?[^-]/.test(token) || /^-\d/.test(token)) {
+        kind = 'option';
+      } else if (shellKeywords.has(token)) {
+        kind = 'keyword';
+        if (['do', 'else', 'elif', 'then'].includes(token)) expectsCommand = true;
+      } else if (expectsCommand && /^[A-Za-z_][A-Za-z0-9_]*=/.test(token)) {
+        kind = 'variable';
+      } else if (expectsCommand) {
+        kind = 'command-name';
+        expectsCommand = false;
+      }
+      html += kind ? shellToken(kind, token) : esc(token);
+      index = end;
+    }
+
+    if (shellHighlightCache.size >= SHELL_HIGHLIGHT_CACHE_LIMIT) {
+      shellHighlightCache.delete(shellHighlightCache.keys().next().value);
+    }
+    shellHighlightCache.set(source, html);
+    return html;
+  }
+  window.highlightShellCommand = highlightShellCommand;
 
   // ANSI escape codes in terminal output → colored HTML (XSS-safe via anser).
   // Fast path: no ESC byte or lib not loaded → plain esc().
@@ -21,16 +224,42 @@
   window.ansiHtml = ansiHtml;
 
   // Render Bash tool
+  function codexCommandSummary(actions) {
+    if (!Array.isArray(actions) || !actions.length) return '';
+    const kinds = new Set(actions.map((action) => action?.type));
+    if (kinds.size !== 1) return '';
+    const kind = actions[0]?.type;
+    if (kind === 'read') {
+      const names = actions.map((action) => action?.name || action?.path).filter(Boolean);
+      return names.length ? `Read ${names.join(', ')}` : '';
+    }
+    if (kind === 'search') {
+      const terms = actions.map((action) => action?.query || action?.path).filter(Boolean);
+      return terms.length ? `Search ${terms.join(', ')}` : '';
+    }
+    if (kind === 'list_files') {
+      const paths = actions.map((action) => action?.path).filter(Boolean);
+      return paths.length ? `List ${paths.join(', ')}` : 'List files';
+    }
+    return '';
+  }
+
   function renderBash(input, result) {
     const cmd = input.command || input.cmd || JSON.stringify(input);
-    const desc = input.description || '';
+    const actions = result?.codexCommandActions || input.codexCommandActions;
+    const summary = codexCommandSummary(actions) || input.description || '';
+    const elevated = input.sandbox_permissions === 'require_escalated';
+    const justification = elevated ? String(input.justification || '').trim() : '';
     return {
       name: 'Bash',
-      desc: desc || truncate(cmd, 60),
-      body: grid([
-        ['IN', `<code>${esc(cmd)}</code>`],
-        result != null ? ['OUT', ansiHtml(truncate(resultText(result), 2000))] : null,
-      ]),
+      desc: summary || cmd,
+      elevated,
+      body: (justification
+        ? `<div class="tool-note"><span>Request reason</span>${esc(justification)}</div>`
+        : '') + grid([
+          ['IN', `<code class="shell-command">${highlightShellCommand(cmd)}</code>`],
+          result != null ? ['OUT', ansiHtml(resultText(result))] : null,
+        ]),
     };
   }
 
@@ -50,29 +279,313 @@
       desc,
       fileLink: input.file_path || '',
       fileLine: line,
-      body: readResultBody(result),
+      body: readResultBody(result, input.file_path || ''),
     };
   }
 
-  function readResultBody(result) {
+  function readResultBody(result, filePath) {
     if (!result) return '';
     const c = result.content;
     if (!c) return '';
     let text = '';
     if (typeof c === 'string') text = c;
     else if (Array.isArray(c)) text = c.filter(b => b.type === 'text' && b.text).map(b => b.text).join('');
-    text = text.trim();
-    if (!text) return '';
-    return `<div class="tool-value clamp" onclick="toggleExpand(this)">${ansiHtml(truncate(text, 2000))}</div>`;
+    text = text.replace(/\r\n?/g, '\n').trimEnd();
+    if (!text.trim()) return '';
+    const source = parseReadSource(text);
+    const highlighted = highlightReadCode(source.text, filePath);
+    const code = source.lineNumbers
+      ? '<div class="read-code-grid">'
+        + '<pre class="read-line-numbers" aria-hidden="true">'
+        + source.lineNumbers.join('\n')
+        + '</pre>'
+        + highlighted
+        + '</div>'
+      : highlighted;
+    return `<div class="tool-value clamp read-value" onclick="toggleExpand(this)">${code}</div>`;
+  }
+
+  function parseReadSource(text) {
+    const lines = text.split('\n');
+    const numbered = [];
+    let index = 0;
+    for (; index < lines.length; index++) {
+      const match = /^\s*(\d+)→(.*)$/.exec(lines[index]);
+      if (!match) break;
+      numbered.push({
+        number: Number(match[1]),
+        text: match[2],
+      });
+    }
+    if (!numbered.length
+      || numbered.some((line, index) =>
+        index > 0 && line.number !== numbered[index - 1].number + 1)) {
+      return { text, lineNumbers: null };
+    }
+    const trailing = lines.slice(index).filter(line => line.trim());
+    if (trailing.length
+      && !(trailing[0].trim() === '<system-reminder>'
+        && trailing.at(-1).trim() === '</system-reminder>')) {
+      return { text, lineNumbers: null };
+    }
+    return {
+      text: numbered.map(line => line.text).join('\n'),
+      lineNumbers: numbered.map(line => line.number),
+    };
   }
 
   // File extension → hljs language
   function detectLang(path) {
-    const ext = (path.split('.').pop() || '').toLowerCase();
+    const file = String(path || '').split(/[\\/]/).pop() || '';
+    const base = file.toLowerCase();
+    const special = {
+      dockerfile: 'dockerfile',
+      makefile: 'makefile',
+      jenkinsfile: 'groovy',
+    };
+    if (special[base]) return special[base];
+    const ext = (file.split('.').pop() || '').toLowerCase();
     const map = { js:'javascript', mjs:'javascript', jsx:'javascript', ts:'typescript', tsx:'typescript',
-      py:'python', rb:'ruby', css:'css', html:'html', json:'json', sh:'bash', yml:'yaml', yaml:'yaml',
-      go:'go', rs:'rust', java:'java', swift:'swift', kt:'kotlin', c:'c', cpp:'cpp', md:'markdown' };
+      py:'python', rb:'ruby', css:'css', scss:'scss', html:'html', htm:'html', xml:'xml', svg:'xml',
+      json:'json', jsonl:'json', sh:'bash', bash:'bash', zsh:'bash', yml:'yaml', yaml:'yaml',
+      go:'go', rs:'rust', java:'java', swift:'swift', kt:'kotlin', kts:'kotlin', c:'c',
+      h:'c', cpp:'cpp', cc:'cpp', cxx:'cpp', hpp:'cpp', cs:'csharp', php:'php', sql:'sql',
+      lua:'lua', dart:'dart', scala:'scala', vue:'html', svelte:'html', md:'markdown',
+      toml:'ini', ini:'ini', conf:'ini', proto:'protobuf', graphql:'graphql', gql:'graphql' };
     return map[ext] || null;
+  }
+
+  function highlightReadCode(text, filePath) {
+    const lang = detectLang(filePath);
+    const className = lang ? `read-code hljs language-${lang}` : 'read-code';
+    if (!lang || text.length > READ_HIGHLIGHT_MAX_CHARS) {
+      return `<code class="${className}">${esc(text)}</code>`;
+    }
+    if (!window.hljs?.getLanguage?.(lang)) {
+      // Highlighted in place once the language loads.
+      window.loadHljsLanguage?.(lang);
+      return `<code class="${className}" data-hljs-language="${lang}">${esc(text)}</code>`;
+    }
+
+    const cacheKey = `${lang}\0${text}`;
+    let html = readHighlightCache.get(cacheKey);
+    if (html !== undefined) {
+      readHighlightCache.delete(cacheKey);
+      readHighlightCache.set(cacheKey, html);
+    } else {
+      try {
+        html = window.hljs.highlight(
+          text,
+          { language: lang, ignoreIllegals: true },
+        ).value;
+      } catch (error) {
+        html = esc(text);
+      }
+      if (readHighlightCache.size >= READ_HIGHLIGHT_CACHE_LIMIT) {
+        readHighlightCache.delete(readHighlightCache.keys().next().value);
+      }
+      readHighlightCache.set(cacheKey, html);
+    }
+    return `<code class="${className}">${html}</code>`;
+  }
+
+  const diffSpecs = new Map();
+  let diffInstances = new WeakMap();
+
+  function diffSpecKey(file, oldStr, newStr) {
+    const source = `${file}\0${oldStr}\0${newStr}`;
+    let first = 2166136261;
+    let second = 5381;
+    for (let index = 0; index < source.length; index++) {
+      const code = source.charCodeAt(index);
+      first = Math.imul(first ^ code, 16777619);
+      second = Math.imul(second, 33) ^ code;
+    }
+    return `diff-${(first >>> 0).toString(36)}-${(second >>> 0).toString(36)}-${source.length.toString(36)}`;
+  }
+
+  function normalizedDiffText(value) {
+    return value.endsWith('\n') ? value : value + '\n';
+  }
+
+  function adoptCurrentDiffInstance(element, host, instance, key) {
+    let current = element?.isConnected && element.dataset.diffKey === key
+      ? element
+      : host?.querySelector(`.diff-container[data-diff-key="${key}"]`);
+    if (!current?.isConnected) return null;
+    const owner = diffInstances.get(current);
+    if (owner && owner !== instance) return null;
+    diffInstances.set(current, instance);
+    return current;
+  }
+
+  async function initializeDiffElement(element) {
+    if (!element) return;
+    const key = element.dataset.diffKey || '';
+    if (!key) return;
+    const existing = diffInstances.get(element);
+    if (existing?.promise) return existing.promise;
+    if (element.dataset.diffState === 'ready'
+      || element.dataset.diffState === 'error') {
+      return;
+    }
+
+    const spec = diffSpecs.get(key);
+    if (!spec) {
+      element.innerHTML = '<div class="diff-unavailable">Diff unavailable</div>';
+      element.dataset.diffState = 'error';
+      return;
+    }
+
+    const instance = { promise: null };
+    const host = element.closest('.tool-node');
+    diffInstances.set(element, instance);
+    instance.promise = (async () => {
+      const content = document.getElementById('content');
+      let staging = null;
+      element.dataset.diffState = 'loading';
+      try {
+        await Promise.all([
+          window.loadDiffViewer?.(),
+          window.loadHljsLanguage?.(detectLang(spec.fullPath)),
+        ]);
+        element = adoptCurrentDiffInstance(element, host, instance, key);
+        if (!element) return;
+        if (!window.Diff || !window.Diff2HtmlUI) throw new Error('Diff viewer unavailable');
+        const a = normalizedDiffText(spec.oldStr);
+        const b = normalizedDiffText(spec.newStr);
+        const patch = window.Diff.createTwoFilesPatch(
+          spec.file, spec.file, a, b, '', '', { context: 3 },
+        );
+        staging = document.createElement('div');
+        staging.className = 'diff-container diff-render-staging';
+        const targetWidth = Math.ceil(
+          element.getBoundingClientRect().width
+          || element.closest('.tool-body')?.getBoundingClientRect().width
+          || content?.clientWidth
+          || 720,
+        );
+        staging.style.width = targetWidth + 'px';
+        document.body.appendChild(staging);
+        const ui = new window.Diff2HtmlUI(staging, patch, {
+          drawFileList: false,
+          fileListToggle: false,
+          fileContentToggle: false,
+          stickyFileHeaders: false,
+          outputFormat: 'line-by-line',
+          matching: 'lines',
+          colorScheme: 'dark',
+          highlight: true,
+        });
+        ui.draw();
+        staging.querySelectorAll(
+          '.d2h-file-wrapper, .d2h-file-diff, .d2h-code-wrapper, .d2h-diff-table, .d2h-diff-tbody',
+        ).forEach((node) => {
+          node.style.backgroundColor = 'transparent';
+        });
+        const lang = detectLang(spec.fullPath);
+        if (lang) {
+          staging.querySelectorAll('.d2h-code-line-ctn').forEach((node) => {
+            node.classList.add('language-' + lang, lang);
+          });
+          staging.querySelectorAll('.d2h-file-wrapper').forEach((node) => {
+            node.dataset.lang = lang;
+          });
+          staging.querySelectorAll('code').forEach((node) => {
+            node.classList.add('language-' + lang, lang);
+          });
+        }
+        ui.highlightCode();
+        if (lang && window.hljs) {
+          staging.querySelectorAll('.d2h-code-line-ctn').forEach((node) => {
+            if (!node.textContent.trim() || node.querySelector('[class*="hljs-"]')) return;
+            const delIns = node.querySelectorAll('del, ins');
+            if (delIns.length) {
+              delIns.forEach((tag) => {
+                if (!tag.textContent.trim()) return;
+                try {
+                  tag.innerHTML = window.hljs.highlight(
+                    tag.textContent, { language: lang, ignoreIllegals: true },
+                  ).value;
+                } catch (e) {}
+              });
+            } else {
+              try {
+                node.innerHTML = window.hljs.highlight(
+                  node.textContent, { language: lang, ignoreIllegals: true },
+                ).value;
+              } catch (e) {}
+            }
+          });
+        }
+        element = adoptCurrentDiffInstance(element, host, instance, key);
+        if (!element) return;
+        if (!staging.querySelector('.d2h-file-wrapper')) {
+          throw new Error('Diff viewer produced no content');
+        }
+        element.replaceChildren(...Array.from(staging.childNodes));
+        staging.remove();
+        element.dataset.diffState = 'ready';
+      } catch (e) {
+        element = adoptCurrentDiffInstance(element, host, instance, key);
+        if (!element) return;
+        console.warn('[diff] render failed:', e);
+        const reason = String(e?.message || e || 'Unknown error');
+        element.innerHTML = '<div class="diff-unavailable">Diff unavailable: '
+          + esc(reason) + '</div>';
+        element.dataset.diffState = 'error';
+      } finally {
+        staging?.remove();
+        element = adoptCurrentDiffInstance(element, host, instance, key);
+        if (!element) return;
+        window.clampOverflow?.(element.closest('.tool-node'));
+        if (state.stickBottom && content
+          && content === document.getElementById('content')) {
+          content.scrollTop = content.scrollHeight;
+        }
+      }
+    })();
+    return instance.promise;
+  }
+
+  window.initializeToolDetails = function (node) {
+    if (!node) return Promise.resolve();
+    return Promise.all(Array.from(node.querySelectorAll('.diff-container[data-diff-key]'))
+      .map((element) => initializeDiffElement(element)));
+  };
+
+  window.hydrateVisibleToolDetails = function (root) {
+    if (!root) return Promise.resolve();
+    const nodes = [];
+    if (root.matches?.('.tool-node:not(.tool-details-collapsed)')) nodes.push(root);
+    root.querySelectorAll?.('.tool-node:not(.tool-details-collapsed)').forEach((node) => {
+      nodes.push(node);
+    });
+    return Promise.all(nodes.map((node) => window.initializeToolDetails(node)));
+  };
+
+  window.resetToolDetails = function () {
+    diffSpecs.clear();
+    diffInstances = new WeakMap();
+    window.resetToolRunGroupState?.();
+  };
+
+  window.afterToolDomMutation = function (root) {
+    return window.hydrateVisibleToolDetails(root);
+  };
+
+  function registerDiffSpec(file, fullPath, oldStr, newStr) {
+    const key = diffSpecKey(fullPath || file, oldStr, newStr);
+    if (!diffSpecs.has(key)) {
+      diffSpecs.set(key, {
+        key,
+        file,
+        fullPath,
+        oldStr,
+        newStr,
+      });
+    }
+    return key;
   }
 
   // Render Edit tool with Diff2HtmlUI
@@ -82,94 +595,19 @@
     const oldStr = input.old_string || '';
     const newStr = input.new_string || '';
 
+    if (result?.is_error) return {
+      name: 'Edit', desc: file, fileLink: fullPath,
+      body: grid([['OUT', esc(resultText(result))]]),
+    };
     let diffHtml = '';
-    if (oldStr || newStr) {
-      const diffId = 'diff-' + Math.random().toString(36).slice(2, 8);
-      // diff2html draws async (setTimeout below), so its height is 0 at scroll
-      // time and the initial scroll-to-bottom lands short. Reserve an estimated
-      // min-height (~18px/row, capped at the 240px collapse threshold); cleared
-      // after draw, residual absorbed by the browser's overflow-anchor.
-      const _oldLines = oldStr ? oldStr.split('\n').length : 0;
-      const _newLines = newStr ? newStr.split('\n').length : 0;
-      const _estH = Math.min((_oldLines + _newLines) * 18 + 12, 240);
-      diffHtml = `<div id="${diffId}" class="diff-container" style="min-height:${_estH}px"></div>`;
-
-      setTimeout(() => {
-        const el = document.getElementById(diffId);
-        if (!el || typeof Diff === 'undefined' || typeof Diff2HtmlUI === 'undefined') return;
-        try {
-          // Ensure trailing newlines so diff library doesn't flag unchanged lines
-          const a = oldStr.endsWith('\n') ? oldStr : oldStr + '\n';
-          const b = newStr.endsWith('\n') ? newStr : newStr + '\n';
-          const patch = Diff.createTwoFilesPatch(file, file, a, b, '', '', { context: 3 });
-          const ui = new Diff2HtmlUI(el, patch, {
-            drawFileList: false, fileListToggle: false, fileContentToggle: false,
-            stickyFileHeaders: false, outputFormat: 'line-by-line',
-            matching: 'lines', colorScheme: 'dark', highlight: true,
-          });
-          ui.draw();
-          // Force remove white backgrounds from structural diff2html elements only
-          el.querySelectorAll('.d2h-file-wrapper, .d2h-file-diff, .d2h-code-wrapper, .d2h-diff-table, .d2h-diff-tbody').forEach(node => {
-            node.style.backgroundColor = 'transparent';
-          });
-          // Set language on code blocks so hljs knows what to highlight
-          const lang = detectLang(fullPath);
-          if (lang) {
-            // Try multiple selectors - diff2html may use different elements
-            el.querySelectorAll('.d2h-code-line-ctn').forEach(ctn => {
-              ctn.classList.add('language-' + lang, lang);
-            });
-            el.querySelectorAll('.d2h-file-wrapper').forEach(w => {
-              w.dataset.lang = lang;
-            });
-            el.querySelectorAll('code').forEach(c => {
-              c.classList.add('language-' + lang, lang);
-            });
-          }
-          ui.highlightCode();
-          // Ensure every line gets syntax highlighting
-          if (lang && typeof hljs !== 'undefined') {
-            el.querySelectorAll('.d2h-code-line-ctn').forEach(ctn => {
-              if (!ctn.textContent.trim()) return;
-              // Skip if already highlighted
-              if (ctn.querySelector('[class*="hljs-"]')) return;
-              const delIns = ctn.querySelectorAll('del, ins');
-              if (delIns.length > 0) {
-                // Highlight text inside each del/ins separately, preserving the tag
-                delIns.forEach(tag => {
-                  if (!tag.textContent.trim()) return;
-                  try { tag.innerHTML = hljs.highlight(tag.textContent, { language: lang, ignoreIllegals: true }).value; } catch(e) {}
-                });
-              } else {
-                try { ctn.innerHTML = hljs.highlight(ctn.textContent, { language: lang, ignoreIllegals: true }).value; } catch(e) {}
-              }
-            });
-          }
-        } catch (e) {
-          el.innerHTML = '<pre style="color:#e6edf3;padding:8px;font-size:12px">'
-            + (oldStr ? oldStr.split('\n').map(l => '<span style="color:#f85149">- ' + esc(l) + '</span>').join('\n') : '')
-            + (oldStr && newStr ? '\n' : '')
-            + (newStr ? newStr.split('\n').map(l => '<span style="color:#3fb950">+ ' + esc(l) + '</span>').join('\n') : '')
-            + '</pre>';
-        }
-        // Drop the reserved estimate before the scrollHeight check below, or an
-        // over-estimate would falsely trigger the collapse.
-        el.style.minHeight = '';
-        // Collapse if rendered height exceeds 240px
-        if (el.scrollHeight > 240) {
-          const bodyContent = el.closest('.tool-body-content');
-          if (bodyContent && !bodyContent.classList.contains('collapsible')) {
-            bodyContent.classList.add('collapsible');
-            bodyContent.insertAdjacentHTML('beforeend',
-              '<span class="clamp-btn" onclick="event.stopPropagation();toggleExpand(this.parentElement)">Show more</span>');
-          }
-        }
-      }, 50);
+    if ((oldStr || newStr)
+      && normalizedDiffText(oldStr) !== normalizedDiffText(newStr)) {
+      const diffKey = registerDiffSpec(file, fullPath, oldStr, newStr);
+      diffHtml = `<div class="diff-container" data-diff-key="${diffKey}"></div>`;
     }
 
-    const status = resultText(result);
-    const statusLabel = status.includes('successfully') ? 'Modified' : (status.includes('Created') ? 'Created' : '');
-    return { name: 'Edit', desc: file, fileLink: fullPath, status: statusLabel, body: diffHtml };
+    return { name: 'Edit', desc: file, fileLink: fullPath, body: diffHtml,
+      status: /^Created\b/i.test(resultText(result).trim()) ? 'Created' : '' };
   }
 
   // Render Write tool
@@ -179,7 +617,17 @@
       name: 'Write',
       desc: file,
       fileLink: input.file_path || '',
-      body: result != null ? `<div class="tool-value clamp" onclick="toggleExpand(this)">${esc(truncate(resultText(result), 500))}</div>` : '',
+      body: result != null ? `<div class="tool-value clamp" onclick="toggleExpand(this)">${esc(resultText(result))}</div>` : '',
+    };
+  }
+
+  function renderViewImage(input) {
+    const file = input.path || input.file_path || '';
+    return {
+      name: 'View Image',
+      desc: shortPath(file),
+      fileLink: file,
+      body: '',
     };
   }
 
@@ -191,25 +639,34 @@
     return {
       name,
       desc,
-      body: result != null && resultText(result).trim() ? `<div class="tool-value clamp" onclick="toggleExpand(this)">${ansiHtml(truncate(resultText(result), 2000))}</div>` : '',
+      body: result != null && resultText(result).trim() ? `<div class="tool-value clamp" onclick="toggleExpand(this)">${ansiHtml(resultText(result))}</div>` : '',
     };
   }
 
   // Render TodoWrite as checklist
   function renderTodo(input, result) {
     const todos = input.todos || [];
-    if (!todos.length) return { name: 'Update Todos', desc: '', body: '' };
-    const icons = { completed: '&#10003;', in_progress: '&#42;', pending: '&#9711;' };
-    const colors = { completed: '#8b949e', in_progress: '#e6edf3', pending: '#8b949e' };
-    const textDeco = { completed: 'line-through', in_progress: 'none', pending: 'none' };
+    const explanation = String(input.explanation || '').trim();
+    if (!todos.length && !explanation) return { name: 'Update Todos', desc: '', body: '' };
+    const labels = { completed: 'Completed', in_progress: 'In progress', pending: 'Pending' };
+    const icons = {
+      completed: '<svg viewBox="0 0 16 16" aria-hidden="true"><circle cx="8" cy="8" r="5.5"/><path d="M5.25 8.15 7.15 10l3.7-4.05"/></svg>',
+      in_progress: '<svg viewBox="0 0 16 16" aria-hidden="true"><circle cx="8" cy="8" r="5.5"/><circle class="plan-status-dot" cx="8" cy="8" r="2.25"/></svg>',
+      pending: '<svg viewBox="0 0 16 16" aria-hidden="true"><circle cx="8" cy="8" r="5.5"/></svg>',
+    };
     const html = todos.map(t => {
-      const s = t.status || 'pending';
-      return `<div style="display:flex;align-items:flex-start;gap:8px;padding:3px 8px;">
-        <span style="color:${colors[s]};font-size:13px;flex-shrink:0;width:16px;text-align:center">${icons[s]}</span>
-        <span style="color:${colors[s]};text-decoration:${textDeco[s]};font-size:12px;line-height:1.5">${esc(t.content)}</span>
+      const s = Object.hasOwn(labels, t.status) ? t.status : 'pending';
+      const text = String(t.content || t.step || '').trim();
+      return `<div class="plan-item plan-item-${s}">
+        <span class="plan-status-icon" role="img" aria-label="${labels[s]}">${icons[s]}</span>
+        <span class="plan-item-text">${esc(text)}</span>
       </div>`;
     }).join('');
-    return { name: 'Update Todos', desc: '', body: `<div style="padding:4px 0">${html}</div>` };
+    const note = explanation
+      ? `<div class="tool-note plan-explanation"><span>Plan note</span>${esc(explanation)}</div>`
+      : '';
+    const list = html ? `<div class="plan-list">${html}</div>` : '';
+    return { name: 'Update Todos', desc: '', body: note + list };
   }
 
   // Render Agent tool with stats
@@ -239,7 +696,7 @@
         }, 1000);
       }, 50);
     }
-    const bodyText = result ? truncate(resultText(result), 2000) : '';
+    const bodyText = result ? resultText(result) : '';
     return {
       name: 'Agent',
       desc,
@@ -258,9 +715,49 @@
       name,
       desc: truncate(JSON.stringify(input), 80),
       body: grid([
-        ['IN', esc(truncate(JSON.stringify(input, null, 2), 1000))],
-        out != null ? ['OUT', ansiHtml(truncate(out, 2000))] : null,
+        ['IN', esc(JSON.stringify(input, null, 2))],
+        out != null ? ['OUT', ansiHtml(out)] : null,
       ]),
+    };
+  }
+
+  function codexMcpInfo(input, result) {
+    const server = result?.codexMcpServer || input?.codexMcpServer || '';
+    const tool = result?.codexMcpTool || input?.codexMcpTool || '';
+    return server && tool ? { server, tool } : null;
+  }
+
+  function renderCodexMcp(input, result) {
+    const invocation = codexMcpInfo(input, result);
+    const visibleInput = Object.fromEntries(
+      Object.entries(input || {}).filter(([key]) => !key.startsWith('codexMcp')),
+    );
+    const out = result != null ? resultText(result) : null;
+    return {
+      name: result ? 'Called' : 'Calling',
+      desc: invocation ? `${invocation.server}.${invocation.tool}` : '',
+      body: grid([
+        ['IN', esc(JSON.stringify(visibleInput, null, 2))],
+        out != null ? ['OUT', ansiHtml(out)] : null,
+      ]),
+    };
+  }
+
+  function renderWebSearch(input) {
+    return {
+      name: 'WebSearch',
+      desc: input.query || input.url || '',
+      body: '',
+    };
+  }
+
+  function renderTerminalWait(input, result) {
+    const command = result?.codexCommand || input.codexCommand || '';
+    return {
+      name: 'WriteStdin',
+      desc: command || `Terminal ${input.session_id || ''}`.trim(),
+      body: '',
+      expandDesc: !!command,
     };
   }
 
@@ -293,6 +790,42 @@
     return s.length > max ? s.slice(0, max) + '...' : s;
   }
 
+  function isExploreCommand(input, result) {
+    return (result?.codexCommandKind || input?.codexCommandKind) === 'explore';
+  }
+
+  window.isCodexExploreTool = function (toolUse, result) {
+    return toolUse?.name === 'Bash' && isExploreCommand(toolUse.input || {}, result);
+  };
+
+  window.isCodexMcpTool = function (toolUse, result) {
+    return !!codexMcpInfo(toolUse?.input, result);
+  };
+
+  window.isCodexHiddenTool = function (toolUse, result) {
+    if (toolUse?.name !== 'WriteStdin' || String(toolUse.input?.chars || '').length) return false;
+    return !!result && result.codexWait !== 'waiting';
+  };
+
+  function codexToolName(name, input, result) {
+    if (codexMcpInfo(input, result)) return result ? 'Called' : 'Calling';
+    if (name === 'Bash') return isExploreCommand(input, result) ? 'Explored' : 'Ran';
+    if (name === 'Edit' && input.file_path && !result?.is_error
+      && resultText(result).split('\n').some(line => line.trim() === `D ${input.file_path}`)) {
+      return 'Deleted';
+    }
+    if (name === 'WriteStdin' && !String(input.chars || '').length) {
+      return result ? 'Waited for background terminal' : 'Waiting for background terminal';
+    }
+    return CODEX_TOOL_NAMES[name] || name;
+  }
+
+  function exitCode(result) {
+    if (Number.isInteger(result?.codexExitCode)) return result.codexExitCode;
+    const match = /Process exited with code\s+(-?\d+)/i.exec(resultText(result));
+    return match ? Number(match[1]) : null;
+  }
+
   // Determine error state from result
   function toolState(result, name) {
     if (!result) return '';
@@ -301,6 +834,8 @@
       return resultText(result).indexOf(CANCEL_MARK) !== -1 ? 'warning' : '';
     }
     if (result.is_error) return 'error';
+    const code = exitCode(result);
+    if (code !== null && code !== 0) return 'error';
     // Only check short results (tool stderr/error messages), not long agent outputs
     const t = resultText(result);
     if (t.length < 500) {
@@ -312,25 +847,165 @@
 
   // Main: render a tool_use + tool_result pair (wrapping tl-item div is in render.js)
   window.detectLang = detectLang;
+  const TOOL_DETAIL_POLICY = Object.freeze({
+    enabled: true,
+    historyCollapsed: true,
+    realtimeCollapsed: true,
+  });
 
-  window.renderToolNode = function (toolUse, toolResult) {
+  window.getToolDetailPolicy = function () {
+    return TOOL_DETAIL_POLICY;
+  };
+
+  window.setToolDetailsCollapsed = function (node, collapsed) {
+    if (!node) return;
+    node.classList.toggle('tool-details-collapsed', collapsed);
+    const header = node.querySelector(':scope > .tool-header');
+    if (header?.classList.contains('tool-details-toggle')
+      && header.getAttribute('aria-expanded') !== String(!collapsed)) {
+      header.setAttribute('aria-expanded', String(!collapsed));
+    }
+  };
+
+  window.toggleToolDetails = function (header) {
+    const selection = window.getSelection?.();
+    if (selection?.toString()) return;
+    const node = header?.closest('.tool-node');
+    if (!node) return;
+    if (header.hasAttribute('data-edit-details')
+      && !toolDetailsSource(node.dataset.toolId)?.full) {
+      return window.loadToolDetailsMore(header, true);
+    }
+    const collapsed = !node.classList.contains('tool-details-collapsed');
+    const groupId = node.dataset.toolDetailsGroup;
+    const root = node.closest('.messages') || document;
+    const members = groupId
+      ? Array.from(root.querySelectorAll('[data-tool-details-group]'))
+        .filter((candidate) => candidate.dataset.toolDetailsGroup === groupId)
+      : [node];
+    for (const member of members) {
+      window.setToolDetailsCollapsed(member, collapsed);
+      if (!collapsed) {
+        Promise.resolve(window.initializeToolDetails?.(member))
+          .then(() => window.clampOverflow?.(member));
+      }
+    }
+    if (groupId) {
+      window.setToolRunGroupCollapsed?.(groupId, collapsed, root);
+    }
+  };
+
+  window.loadToolDetailsMore = async function (button, edit = false) {
+    if (!button) return;
+    if (button.getAttribute('aria-busy') === 'true') return;
+    let node = button.closest('.tool-node');
+    if (!node) return;
+    const toolId = node.dataset.toolId;
+    const requestedSession = state.wsSessionId;
+    const requestedDevice = state.appState.device;
+    button.setAttribute('aria-busy', 'true');
+    const indicator = document.createElement('span');
+    indicator.className = 'tool-detail-loading';
+    indicator.innerHTML = loadingSpinner({ size: 'small' });
+    if (edit) button.append(indicator);
+    else button.innerHTML = indicator.innerHTML;
+    node.querySelector('.tool-detail-error')?.remove();
+    try {
+      await loadToolDetails(toolId);
+      if (requestedSession !== state.wsSessionId || requestedDevice !== state.appState.device) return;
+      node = Array.from(document.querySelectorAll('.messages [data-tool-id]'))
+        .find((member) => member.dataset.toolId === toolId);
+      if (!node) return;
+      const source = toolDetailsSource(toolId);
+      if (!source?.full) return;
+      const collapsed = edit || node.classList.contains('tool-details-collapsed');
+      node.innerHTML = window.renderToolNode(
+        source.toolUse, source.toolResult, state.appState.runtime, { collapsed },
+      );
+      window.setToolDetailsCollapsed(node, collapsed);
+      window.markToolRunGroups?.(node.closest('.messages') || document);
+      if (edit) {
+        button.removeAttribute('aria-busy');
+        button = node.querySelector(':scope > .tool-header');
+        button.setAttribute('aria-busy', 'true');
+        button.append(indicator);
+      }
+      await window.initializeToolDetails?.(node);
+      if (edit) window.setToolDetailsCollapsed(node, false);
+      window.clampOverflow?.(node);
+      const body = node.querySelector('.tool-body-content');
+      const more = body?.querySelector('.clamp-btn');
+      if (more) window.toggleExpand?.(more.parentElement);
+      else if (body) {
+        body.classList.add('open');
+        body.querySelectorAll('.read-value').forEach((value) => value.classList.add('expanded'));
+      }
+    } catch (error) {
+      if (node?.isConnected && requestedSession === state.wsSessionId
+        && requestedDevice === state.appState.device) {
+        const errorHtml = '<div class="tool-detail-error">'
+          + esc(error.message || 'Unable to load details. Click to retry.') + '</div>';
+        if (edit) button.insertAdjacentHTML('afterend', errorHtml);
+        else {
+          const body = button.closest('.tool-body-content');
+          body?.classList.add('open');
+          body?.querySelectorAll('.read-value').forEach(value => value.classList.add('expanded'));
+          button.insertAdjacentHTML('beforebegin', errorHtml);
+        }
+      }
+    } finally {
+      button.removeAttribute('aria-busy');
+      if (edit) indicator.remove();
+      else button.textContent = 'Show more';
+    }
+  };
+
+  window.toggleToolDesc = function (header) {
+    const expanded = header.classList.toggle('expanded-desc');
+    header.setAttribute('aria-expanded', String(expanded));
+  };
+
+  window.renderToolNode = function (toolUse, toolResult, runtime, options = {}) {
+    ({ toolUse, toolResult } = observeToolDetails(toolUse, toolResult));
     const name = toolUse.name || 'Tool';
+    const truncated = toolResult?.truncated === true
+      || (toolUse.truncated === true && !(name === 'Edit' && toolResult?.is_error));
     const input = toolUse.input || {};
+    const source = toolDetailsSource(toolUse.id);
+    const editRemote = name === 'Edit' && !toolResult?.is_error
+      && (source?.toolUse.truncated === true || source?.toolResult?.truncated === true);
+    const editPending = editRemote && !source?.full;
+    const codexMcp = runtime === 'codex' && codexMcpInfo(input, toolResult);
+    const detailPolicy = window.getToolDetailPolicy(runtime);
+    const requestedDetailsCollapsed = detailPolicy.enabled && !!options.collapsed;
     const dispatchers = {
       Bash: () => renderBash(input, toolResult),
       Read: () => renderRead(input, toolResult),
-      Edit: () => renderEdit(input, toolResult),
+      Edit: () => renderEdit(editPending ? { file_path: input.file_path } : input, toolResult),
       Write: () => renderWrite(input, toolResult),
       Grep: () => renderSearch('Grep', input, toolResult),
       Glob: () => renderSearch('Glob', input, toolResult),
+      ViewImage: () => renderViewImage(input),
       TodoWrite: () => renderTodo(input, toolResult),
       Agent: () => renderAgent(input, toolResult),
+      WebSearch: () => renderWebSearch(input),
+      WriteStdin: () => !String(input.chars || '').length
+        ? renderTerminalWait(input, toolResult)
+        : {
+          ...renderGeneric(name, input, toolResult),
+          desc: String(input.chars),
+        },
     };
-    const info = (dispatchers[name] || (() => renderGeneric(name, input, toolResult)))();
+    const info = codexMcp
+      ? renderCodexMcp(input, toolResult)
+      : (dispatchers[name] || (() => renderGeneric(name, input, toolResult)))();
+    if (runtime === 'codex') info.name = codexToolName(name, input, toolResult);
     // Store state as data attr for CSS (render.js adds .error/.warning to tl-item)
     window._lastToolState = toolState(toolResult, name);
 
-    const statusHtml = info._statsHtml || (info.status ? `<span class="tool-status">${esc(info.status)}</span>` : '');
+    const status = info.status || '';
+    const statusHtml = info._statsHtml || (status ? `<span class="tool-status">${esc(status)}</span>` : '');
+    const elevatedHtml = info.elevated ? '<span class="tool-flag">Elevated request</span>' : '';
     const fileLine = info.fileLine || '';
     const matchId = (!fileLine && info.fileLink && (name === 'Edit' || name === 'Write')) ? (toolUse.id || '') : '';
     const descHtml = info.fileLink
@@ -340,15 +1015,41 @@
 
     const noClamp = name === 'TodoWrite';
     const clampClass = noClamp ? ' no-clamp' : (info.collapsible ? ' collapsible' : '');
-    const bodyHtml = info.body
+    const previewMore = truncated && (name !== 'Edit' || toolResult?.is_error)
+      ? '<span class="clamp-btn tool-preview-more" role="button" tabindex="0"'
+        + ' onclick="event.stopPropagation();loadToolDetailsMore(this)"'
+        + ' onkeydown="if(event.key===\'Enter\'||event.key===\' \'){event.preventDefault();event.stopPropagation();loadToolDetailsMore(this)}">Show more</span>'
+      : '';
+    const bodyHtml = !editPending && (info.body || truncated)
       ? `<div class="tool-body">
-          <div class="tool-body-content${clampClass}" id="${id}" ${noClamp ? '' : `onclick="toggleExpand(this)"`}>${info.body}</div>
+          <div class="tool-body-content${clampClass}" id="${id}"${truncated ? ' data-tool-preview="true"' : ''} ${noClamp ? '' : `onclick="toggleExpand(this)"`}>${info.body || ''}${previewMore}</div>
         </div>`
       : '';
+    const detailsEnabled = detailPolicy.enabled && (!!info.body || truncated || editPending);
+    const detailsCollapsed = detailsEnabled && (requestedDetailsCollapsed || editPending);
+    window._lastToolHasDetails = detailsEnabled;
+    const baseHeaderClass = detailsEnabled
+      ? 'tool-header tool-details-toggle'
+      : (info.expandDesc ? 'tool-header expandable-desc' : 'tool-header');
+    const headerAttrs = detailsEnabled
+      ? ` role="button" tabindex="0" aria-expanded="${String(!detailsCollapsed)}"${truncated ? ' data-tool-preview="true"' : ''}
+        ${editRemote ? 'data-edit-details="true"' : ''}
+        onclick="toggleToolDetails(this)"
+        onkeydown="if(event.key==='Enter'||event.key===' '){event.preventDefault();toggleToolDetails(this)}"`
+      : info.expandDesc
+      ? ` role="button" tabindex="0" aria-expanded="false"
+        onclick="toggleToolDesc(this)"
+        onkeydown="if(event.key==='Enter'||event.key===' '){event.preventDefault();toggleToolDesc(this)}"`
+      : '';
+    const chevronHtml = detailsEnabled
+      ? '<span class="tool-detail-chevron" aria-hidden="true">&#8250;</span>'
+      : '';
 
-    return `<div class="tool-header">
+    return `<div class="${baseHeaderClass}"${headerAttrs}>
+        ${chevronHtml}
         <span class="tool-name">${esc(info.name)}</span>
         ${descHtml}
+        ${elevatedHtml}
         ${statusHtml}
       </div>
       ${bodyHtml}`;

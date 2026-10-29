@@ -1,0 +1,306 @@
+import assert from 'node:assert/strict';
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
+import { spawnSync } from 'node:child_process';
+import test from 'node:test';
+import { fileURLToPath } from 'node:url';
+
+import {
+  clearLiveMessageRegistry,
+  registerClaudeInterruptTurn,
+} from '../../bridge/live-message-registry.mjs';
+import {
+  correlateClaudeInterruptMessage,
+  createClaudeFileQueue,
+  pollAgentStates,
+  resetAgentPollState,
+  shouldPersistClaudeJsonlMessage,
+  shouldSkipClaudeSession,
+} from '../../bridge/watcher.mjs';
+
+test.afterEach(clearLiveMessageRegistry);
+
+test('watcher queue exposes delayed content and repairs header-only changes', (t) => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'resume-watcher-'));
+  t.after(() => fs.rmSync(home, { recursive: true, force: true }));
+  const result = spawnSync(process.execPath, ['--input-type=module'], {
+    cwd: fileURLToPath(new URL('../../', import.meta.url)),
+    env: { ...process.env, HOME: home, USERPROFILE: home },
+    encoding: 'utf8',
+    timeout: 30_000,
+    input: `
+      import assert from 'node:assert/strict';
+      import fs from 'node:fs';
+      import path from 'node:path';
+      import { createServer } from 'node:http';
+      import { CLAUDE_PROJECTS } from './bridge/config.mjs';
+      import { initHttp } from './bridge/http.mjs';
+      import { createClaudeFileQueue } from './bridge/watcher.mjs';
+      import { knownProjects, recentSessions } from './bridge/sync.mjs';
+      const requests = [];
+      const server = createServer(async (request, response) => {
+        let body = '';
+        for await (const chunk of request) body += chunk;
+        requests.push(JSON.parse(body));
+        response.end('{}');
+      });
+      await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
+      try {
+        const config = { server: 'http://127.0.0.1:' + server.address().port, apiKey: 'test', deviceName: 'test' };
+        initHttp(config);
+        const id = '12345678-1234-4123-8123-123456789012';
+        const filename = path.join('-review', id + '.jsonl');
+        const file = path.join(CLAUDE_PROJECTS, filename);
+        knownProjects.add('-review');
+        fs.mkdirSync(path.dirname(file), { recursive: true });
+        fs.writeFileSync(file, JSON.stringify({ type: 'queue-operation', operation: 'enqueue' }) + '\\n');
+        const enqueue = createClaudeFileQueue(config);
+        await enqueue(filename, id);
+        assert.equal(recentSessions.has(id), false);
+        assert.equal(requests.length, 0);
+        fs.appendFileSync(file, JSON.stringify({
+          type: 'user', uuid: 'prompt', entrypoint: 'sdk-cli',
+          message: { content: '/code-review PR 64' },
+        }) + '\\n');
+        const original = fs.readFileSync(file, 'utf8');
+        await enqueue(filename, id);
+        const patched = fs.readFileSync(file, 'utf8');
+        assert.equal(JSON.parse(patched.trim().split('\\n')[1]).entrypoint, 'cli');
+        assert.equal(patched.length, original.length);
+        assert.equal(recentSessions.has(id), true);
+        assert.equal(requests.find(body => body.sessions?.[0]?.id === id).statusDelta.from, 'new');
+        const count = requests.length;
+        fs.writeFileSync(file, original);
+        await enqueue(filename, id);
+        await enqueue(filename, id);
+        assert.equal(fs.readFileSync(file, 'utf8'), patched);
+        assert.equal(requests.length, count);
+      } finally {
+        server.closeAllConnections();
+        await new Promise(resolve => server.close(resolve));
+      }
+    `,
+  });
+  assert.equal(result.status, 0, `${result.error || ''}\n${result.stdout}\n${result.stderr}`);
+});
+
+test('parent file updates share one queue while child delivery stays independent', async () => {
+  let release;
+  const blocked = new Promise(resolve => { release = resolve; });
+  let parentReads = 0;
+  let active = 0;
+  let maxActive = 0;
+  let delivered = 0;
+  const enqueue = createClaudeFileQueue({}, async (_config, _file, id, queue) => {
+    if (id !== 'parent') {
+      delivered++;
+      queue('parent.jsonl', 'parent');
+      return;
+    }
+    parentReads++;
+    maxActive = Math.max(maxActive, ++active);
+    if (parentReads === 1) await blocked;
+    active--;
+  });
+  await Promise.all([enqueue('child-a.jsonl', 'child-a'), enqueue('child-b.jsonl', 'child-b')]);
+  assert.equal(delivered, 2);
+  assert.equal(parentReads, 1);
+  release();
+  await enqueue('parent.jsonl', 'parent');
+  assert.equal(parentReads, 2);
+  assert.equal(maxActive, 1);
+});
+
+test('metadata-only completion reaches the watcher and retries before marking the child synchronized', t => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'subagent-completion-'));
+  t.after(() => fs.rmSync(home, { recursive: true, force: true }));
+  const result = spawnSync(process.execPath, ['--input-type=module'], {
+    cwd: fileURLToPath(new URL('../../', import.meta.url)),
+    env: { ...process.env, HOME: home, USERPROFILE: home },
+    encoding: 'utf8', timeout: 15_000,
+    input: `
+      import assert from 'node:assert/strict';
+      import fs from 'node:fs';
+      import path from 'node:path';
+      import { createServer } from 'node:http';
+      import { CLAUDE_PROJECTS } from './bridge/config.mjs';
+      import { initHttp } from './bridge/http.mjs';
+      import { synced } from './bridge/extract.mjs';
+      import { rebuildAgentCounts } from './bridge/agent-counts.mjs';
+      import { startWatcher, createClaudeFileQueue } from './bridge/watcher.mjs';
+      import { lastKnownStatus, recentSessions } from './bridge/sync.mjs';
+      const parent = 'parent', child = parent + ':subagent:agent-done';
+      const accepted = [];
+      let failed = false;
+      const server = createServer(async (request, response) => {
+        let raw = ''; for await (const chunk of request) raw += chunk;
+        const body = JSON.parse(raw);
+        if (!failed) {
+          assert.equal(lastKnownStatus.get(child), 'running');
+          failed = true; response.writeHead(503).end('{}'); return;
+        }
+        accepted.push(body); response.end('{}');
+      });
+      await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
+      let watcher;
+      try {
+        const config = { server: 'http://127.0.0.1:' + server.address().port, apiKey: 'test', deviceName: 'test' };
+        initHttp(config);
+        const relative = path.join('-repo', parent, 'subagents', 'agent-done.jsonl');
+        const file = path.join(CLAUDE_PROJECTS, relative);
+        fs.mkdirSync(path.dirname(file), { recursive: true });
+        fs.writeFileSync(file, JSON.stringify({ type: 'assistant', message: { stop_reason: 'tool_use', content: [] } }) + '\\n');
+        fs.writeFileSync(file.replace('.jsonl', '.meta.json'), '{"finished":false}');
+        synced.set(child, 1); recentSessions.add(parent); recentSessions.add(child);
+        lastKnownStatus.set(parent, 'running'); lastKnownStatus.set(child, 'running');
+        rebuildAgentCounts([
+          { id: parent, project: '-repo', status: 'running' },
+          { id: child, project: '-repo', parentSessionId: parent, threadKind: 'subagent', status: 'running' },
+        ]);
+        watcher = startWatcher(config);
+        fs.writeFileSync(file.replace('.jsonl', '.meta.json'), '{"finished":true}');
+        const deadline = Date.now() + 5000;
+        while (lastKnownStatus.get(child) !== 'completed' && Date.now() < deadline) {
+          await new Promise(resolve => setTimeout(resolve, 20));
+        }
+        assert.equal(lastKnownStatus.get(child), 'completed');
+        assert.equal(accepted.length, 1);
+        assert.equal(accepted[0].sessions[0].status, 'completed');
+        assert.equal(accepted[0].agentCountUpdates[0].runningAgentCount, 0);
+        const enqueue = createClaudeFileQueue(config);
+        await enqueue(relative, child);
+        assert.equal(accepted.length, 1, 'duplicate completion must not be posted again');
+      } finally {
+        watcher?.close(); server.closeAllConnections();
+        await new Promise(resolve => server.close(resolve));
+      }
+    `,
+  });
+  assert.equal(result.status, 0, `${result.error || ''}\n${result.stdout}\n${result.stderr}`);
+});
+
+test('failed parent updates retry without waiting for another file event', { timeout: 2000 }, async (t) => {
+  t.mock.method(console, 'error', () => {});
+  let attempts = 0;
+  let delivered = 0;
+  let resolveRetry;
+  const retried = new Promise(resolve => { resolveRetry = resolve; });
+  const enqueue = createClaudeFileQueue({}, async (_config, _file, id) => {
+    if (id !== 'parent') { delivered++; return; }
+    if (++attempts === 1) throw new Error('HTTP 500');
+    resolveRetry();
+  }, 10);
+  await enqueue('parent.jsonl', 'parent');
+  await enqueue('child.jsonl', 'child');
+  assert.equal(delivered, 1);
+  await new Promise(resolve => setTimeout(resolve, 20));
+  await retried;
+  assert.equal(attempts, 2);
+});
+
+test('runtime-owned Claude JSONL rows are persistence-only', () => {
+  assert.equal(shouldPersistClaudeJsonlMessage(true, null), true);
+  assert.equal(shouldPersistClaudeJsonlMessage(false, {
+    pushed: true,
+    runtimeOwned: true,
+  }), true);
+});
+
+test('external Claude JSONL rows remain realtime', () => {
+  assert.equal(shouldPersistClaudeJsonlMessage(false, null), false);
+  assert.equal(shouldPersistClaudeJsonlMessage(false, {
+    pushed: false,
+    runtimeOwned: false,
+  }), false);
+});
+
+test('empty non-daemon Claude sessions are skipped regardless of running status', () => {
+  assert.equal(shouldSkipClaudeSession('', null), true);
+  assert.equal(shouldSkipClaudeSession('Real user prompt', null), false);
+  assert.equal(shouldSkipClaudeSession('', { agentName: 'worker' }), false);
+});
+
+test('watcher preserves the native UUID while linking the Claude interrupt to its live turn', () => {
+  registerClaudeInterruptTurn('session-1', 'sent-turn-1', 1_000);
+  const message = correlateClaudeInterruptMessage('session-1', {
+    uuid: 'claude-jsonl-uuid',
+    type: 'user',
+    content: [{ type: 'text', text: '[Request interrupted by user]' }],
+    timestamp: '2026-09-01T09:18:42.101Z',
+  }, 1_001);
+
+  assert.deepEqual(message, {
+    uuid: 'claude-jsonl-uuid',
+    nativeId: 'live:interrupt:sent-turn-1',
+    turnId: 'sent-turn-1',
+    type: 'user',
+    content: [{ type: 'text', text: '[Request interrupted by user]' }],
+    timestamp: '2026-09-01T09:18:42.101Z',
+  });
+});
+
+test('unrelated rows do not consume a pending Claude interrupt turn', () => {
+  registerClaudeInterruptTurn('session-1', 'sent-turn-1', 1_000);
+  const assistant = {
+    uuid: 'assistant-1',
+    type: 'assistant',
+    content: [{ type: 'text', text: 'partial' }],
+  };
+
+  assert.equal(
+    correlateClaudeInterruptMessage('session-1', assistant, 1_001),
+    assistant,
+  );
+  assert.equal(
+    correlateClaudeInterruptMessage('session-1', {
+      uuid: 'claude-jsonl-uuid',
+      type: 'user',
+      content: [{
+        type: 'text',
+        text: '[Request interrupted by user for tool use]',
+      }],
+    }, 1_002).uuid,
+    'claude-jsonl-uuid',
+  );
+});
+
+test('external Claude interrupts retain their native JSONL identity', () => {
+  const message = {
+    uuid: 'external-interrupt',
+    type: 'user',
+    content: [{ type: 'text', text: '[Request interrupted by user]' }],
+  };
+
+  assert.equal(
+    correlateClaudeInterruptMessage('session-1', message, 1_000),
+    message,
+  );
+});
+
+test('failed realtime agent status push is retried on the next poll', async () => {
+  resetAgentPollState();
+  const agents = new Map([['agent-session-1', {
+    agentName: 'worker',
+    agentDetail: '',
+    status: 'completed',
+  }]]);
+  let attempts = 0;
+  const options = {
+    agents,
+    findSessionFile: () => '/tmp/agent-session-1.jsonl',
+    poolOwns: () => false,
+    getSessionMetadata: () => ({ preview: 'worker', model: 'test' }),
+    pushAgentMeta: async () => {
+      attempts++;
+      if (attempts === 1) throw new Error('temporary server failure');
+    },
+  };
+
+  await pollAgentStates({ deviceName: 'test' }, options);
+  await pollAgentStates({ deviceName: 'test' }, options);
+  await pollAgentStates({ deviceName: 'test' }, options);
+
+  assert.equal(attempts, 2);
+  resetAgentPollState();
+});

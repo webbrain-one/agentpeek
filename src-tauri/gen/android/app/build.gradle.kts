@@ -15,18 +15,20 @@ val tauriProperties = Properties().apply {
 
 android {
     compileSdk = 36
-    namespace = "com.agentpeek.app"
+    namespace = "com.batonai.app"
     signingConfigs {
         create("release") {
-            storeFile = file("../agentpeek.keystore")
-            storePassword = "agentpeek123"
-            keyAlias = "agentpeek"
-            keyPassword = "agentpeek123"
+            storeFile = file("../baton.keystore")
+            storePassword = System.getenv("ANDROID_KEYSTORE_PASSWORD")
+                ?: error("ANDROID_KEYSTORE_PASSWORD is required for Android signing")
+            keyAlias = "baton"
+            keyPassword = System.getenv("ANDROID_KEY_PASSWORD")
+                ?: error("ANDROID_KEY_PASSWORD is required for Android signing")
         }
     }
     defaultConfig {
         manifestPlaceholders["usesCleartextTraffic"] = "false"
-        applicationId = "com.agentpeek.app"
+        applicationId = "com.batonai.app"
         minSdk = 24
         targetSdk = 36
         versionCode = tauriProperties.getProperty("tauri.android.versionCode", "1").toInt()
@@ -65,7 +67,7 @@ android {
     applicationVariants.all {
         outputs.all {
             (this as com.android.build.gradle.internal.api.BaseVariantOutputImpl)
-                .outputFileName = "AgentPeek.apk"
+                .outputFileName = "Baton.apk"
         }
     }
 }

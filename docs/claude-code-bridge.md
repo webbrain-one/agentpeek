@@ -2,12 +2,16 @@
 
 ## Overview
 
-**AgentPeek** — view and interact with Claude Code sessions from your phone. No wrapping of `claude` command.
+**Baton** — view and interact with Claude Code sessions from your phone. No wrapping of `claude` command.
+
+This document covers the Claude Code runtime. The shared runtime model and current Codex
+integration status are documented in [codex.md](codex.md); the wire contract is in
+[api.md](api.md).
 
 ## Architecture
 
 ```
-Mac/Linux/EC2                       AWS (Serverless)                    AgentPeek App
+Mac/Linux/Windows                   AWS (Serverless)                    Baton App
 ┌──────────────┐              ┌───────────────────────┐           ┌──────────────┐
 │ Claude Code  │              │ REST API GW + Lambda  │           │              │
 │ (unchanged)  │              │ (FastAPI in Docker)   │           │ Device/      │
@@ -30,13 +34,18 @@ Mac/Linux/EC2                       AWS (Serverless)                    AgentPee
 ## Bridge
 
 ### Startup
-1. Scan `~/.claude/projects/` → collect ALL session metadata (preview from `ai-title`)
+The current startup coordinator discovers all registered runtime adapters, merges their catalogs,
+and computes Device/Project aggregates once. The steps below describe the Claude-specific part.
+
+1. Scan `~/.claude/projects/` → collect ALL session metadata. Preview follows Claude
+   TUI order: `custom-title` → `ai-title` → `summary` → first prompt → `last-prompt`;
+   `~/.claude/history.jsonl` preserves the original first prompt, including slash commands.
 2. `POST /api/bridge/sync-sessions` → full upload to DDB (only on startup)
 3. Build `recentSessions` set (sessions active in last 24h) for periodic sync
 4. Initial message sync: active session per project (latest only) + recent 24h sessions → extract + upload to DDB
    - Active: for each running project, only the most recent session (the one being used)
    - Recent: sessions with mtime within 24h
-   - Sessions synced in parallel (sliding window, concurrency=4)
+   - Sessions synced in parallel (sliding window, shared concurrency=2)
    - Images: compressed to 1280px JPEG (quality=90) via sharp → uploaded to S3 via Lambda
    - Messages batched by byte size (≤4MB per POST)
    - Line-number tracking: only reads new lines, no UUID set in memory
@@ -50,22 +59,59 @@ Mac/Linux/EC2                       AWS (Serverless)                    AgentPee
   - WS ack: `wsSendWithAck` waits for server `messages_ack` (5s timeout), only advances synced line on ack
   - WS fallback: ack timeout or WS disconnected → HTTP POST to DDB
   - Metadata sync only on: status change, new session, or ai-title arrived (via `lastKnownStatus` cache)
-- **Periodic check (1min)** → `checkStopped()` detects disappeared CC processes via `ps aux`
-  - Only checks sessions previously known as running/idle
-  - Updates status to stopped if process gone
-- **Status detection** → three-layer architecture:
-  - `statusFromEntry(entry)`: pure function, entry → running/idle/null. Shared by watcher + file reader
+- **Periodic check (5min)** → `checkStopped()` detects disappeared CC processes via `ps aux`
+  - Checks sessions previously known as active
+  - Updates status to completed if the process is gone
+- **Status detection** → process, daemon, pool, and JSONL sources:
+  - `statusFromEntry(entry)`: pure function, entry → running/needs_input/completed/null
   - `getSessionStatus()`: reads last lines of jsonl via reverse `\n` scan + process detection. Used by syncSessions/checkStopped
   - Watcher: uses `statusFromEntry()` directly on already-parsed data (no file re-read)
   - `getRunningInfo()`: `ps aux` + `--resume` arg extraction → exact session ID + project cwd
-  - stop_reason mapping: `end_turn`/`max_tokens`/`stop_sequence` → idle, `tool_use`/`null` → running, `user` last → running
-  - Interrupt detection: `[Request interrupted by user*]` → idle, `tool_result(is_error=true)` only → idle
+  - stop_reason mapping: `end_turn`/`max_tokens`/`stop_sequence` → completed, `tool_use`/`null` → running
+  - structured `AskUserQuestion`/`ExitPlanMode` tool use → needs_input
+  - Interrupt detection: `[Request interrupted by user*]` and error-only tool results → completed
+  - Busy pool-owned status overrides daemon and JSONL; roster-active daemon status overrides external process/JSONL
   - terminal CC (launched with `--resume`): exact session match → precise status
-  - VS Code CC: no `--resume` → project-level detection + file mtime heuristic (mtime > 5min → stopped regardless of content)
+  - VS Code CC: no `--resume` → project-level detection + file mtime heuristic (mtime > 5min → completed)
 - **isMeta filtering** → VS Code `--replay-user-messages` creates duplicate user entries with `isMeta=true`
   - Skip `isMeta` user messages (avoid duplicate user input)
   - Keep their assistant replies (contain real CC output: first text paragraph, thinking blocks)
 - **WS connection** → auto-discover WS URL from `GET /api/bridge/config`, auto-reconnect on disconnect
+
+### Bridge connection recovery
+
+Healthy sockets are reused. The same Node.js timers handle normal operation and
+resume on macOS, Windows, and Linux; there is no extra sleep/network listener.
+The system DNS resolver is unchanged.
+
+- Protocol Ping: every 20 seconds, one outstanding probe, five-second Pong
+  timeout. It does not renew database records or check updates. Silent failure
+  detection takes up to about 25 seconds plus reconnect time, not a hard SLA.
+- Business heartbeat: every four minutes, ten-second timeout, independent of
+  Pong. Both probes run immediately on connection; only the business reply
+  confirms backend responsiveness.
+- Reconnect: first retry immediate, subsequent retries every five seconds,
+  five-second handshake deadline. Configuration discovery has a three-second
+  timeout, retries every five seconds, and caches the URL for the same server.
+- Shutdown clears timers; old sockets and late Pongs cannot affect a replacement.
+  Duplicate connect calls reuse the current attempt. Queued messages still flush.
+- Version checks run on startup/reconnect or a heartbeat version mismatch, at
+  most once per four minutes, without a dedicated timer. Version requests have a
+  ten-second timeout. Updates can restart Bridge and interrupt active terminals.
+- The instance lock reserves a loopback port (20000–39999) derived from the
+  canonical Bridge directory. The kernel releases it on exit or crash; port
+  conflicts fail closed. PID metadata also protects an older running Bridge:
+  it is never killed automatically, and cleanup only removes the owner's PID.
+- Installers preserve `bridgeId`; the server atomically assigns one owner per
+  account/device, retires old connections, and rejects stale handshakes/messages.
+  Replaced Bridges stop retrying. Routing follows the owner despite index lag.
+- Online status is a recent control-connection lease, not a delivery guarantee.
+  The four-minute heartbeat has five seconds of freshness slack; business
+  acknowledgements, not Pongs, establish message delivery. Deploy the server
+  before Bridge updates. OS/network/backend delays can extend recovery time.
+
+Regression tests: `node --test test/bridge/sleep-gap-monitor.test.mjs test/bridge/updater.test.mjs`
+and `python3 -m pytest test/server/test_bridge_connection_ownership.py`.
 
 ### Data extraction
 
@@ -92,27 +138,46 @@ Content block processing:
 ### Auto-start
 - macOS: launchd plist (`~/Library/LaunchAgents/`)
 - Linux: systemd user service (`~/.config/systemd/user/`)
+- Windows: Task Scheduler runs `bridge-launcher.mjs`
+
+The launcher retries unexpected exits after five seconds and update exits after
+one second. Successful exits and an explicit stop do not restart the child.
+Task Scheduler remains the fallback for launcher failures; its existing
+one-minute restart interval is unchanged.
+
+### Claude credentials in background services
+
+On macOS/Linux, directly resolved Claude executables load `~/.claude/env.sh`
+when present, exporting its settings and adding Node's directory and `~/.local/bin`
+to the child process PATH. This optional file must be trusted Bash code; Bridge
+does not copy its credentials. Without it, existing authentication is unchanged.
+Automatic updates restart Bridge, so no manual restart or unit changes are needed
+for this fix. Later credential edits apply to new Claude processes; restart Bridge
+to refresh already-running processes immediately.
 
 ## DynamoDB
 
 ```
 BridgeSessions
   PK: accountId (SHA256(apiKey)[:16])
-  SK: deviceName#projectHash#sessionId
+  SK: DEV#deviceName
+      PROJ#deviceName#projectHash
+      SESS#deviceName#projectHash#sessionId
   Attributes: deviceName, projectHash, projectName, sessionId,
-              lastActive, preview, model, status (running/idle/stopped), size, os
-  TTL: 90 days
+              lastActive, preview, model, status (running/needs_input/completed),
+              runtime, nativeSessionId, size, os
+  TTL: no value written
 
 BridgeMessages
   PK: sessionId
   SK: timestamp#uuid (e.g. "2026-03-27T10:30:00.000Z#msg_abc123")
   Attributes: uuid, type, content (JSON), timestamp
-  TTL: 30 days
+  TTL: 90 days
 ```
 
 ### Worktree project-hash normalization (one session = one row)
 
-The session row's SK is `deviceName#projectHash#sessionId`, so a session's
+The session row's SK is `SESS#deviceName#projectHash#sessionId`, so a session's
 identity in DDB is `(projectHash, sessionId)` — **not sessionId alone**. That
 breaks when a session moves between project dirs.
 
@@ -174,16 +239,16 @@ Body: {
 
 ```
 GET /api/bridge/devices
-→ { devices: [{ deviceName, os, lastActive, projectCount, sessionCount, runningCount, idleCount }] }
+→ { devices: [{ deviceName, os, lastActive, projectCount, sessionCount, runningCount, needsInputCount, runtimeCapabilities }] }
 
 GET /api/bridge/projects?device=MacBook-Pro
-→ { projects: [{ projectHash, projectName, lastActive, sessionCount, runningCount, idleCount }] }
+→ { projects: [{ projectHash, projectName, lastActive, sessionCount, runningCount, needsInputCount }] }
 
 GET /api/bridge/sessions?device=MacBook-Pro&project=-Users-...
-→ { sessions: [{ sessionId, preview, lastActive, size, model, status }] }
+→ { sessions: [{ sessionId, nativeSessionId, runtime, preview, lastActive, size, model, status }] }
 
-GET /api/bridge/messages?session=abc&after=<timestamp>
-→ { messages: [{ uuid, type, content, timestamp }] }
+GET /api/bridge/messages?session=abc&after=<timestamp>&device=D&project=P
+→ { messages: [{ uuid, type, content, timestamp }], status: "running|needs_input|completed" }
 ```
 
 ## WebSocket Protocol
@@ -197,7 +262,7 @@ Bridge detects new message in .jsonl:
   1. Bridge → WS → API GW → Lambda
   2. Lambda in parallel:
      a. Query Subscriptions → post_to_connection → App (priority, latency-sensitive)
-     b. Write DDB BridgeMessages (fallback cache, non-blocking)
+     b. Write DDB BridgeMessages, then ack; write failure falls back to Bridge HTTP upload
   Bridge maintains one WS connection, no longer writes DDB directly via HTTP POST.
 ```
 
@@ -214,7 +279,8 @@ Server → App:  { action: "messages", sessionId: "abc", messages: [...] }
 ```
 App → Server:  { action: "heartbeat" }
 Bridge → Server:  { action: "heartbeat" }
-(every 5 minutes)
+Server → Bridge:  { action: "heartbeat", ts: 1789900000, bridgeVersion: "1.0.0-abcdef0" }
+(Bridge: every 4 minutes)
 ```
 
 ### Send message
@@ -225,9 +291,11 @@ App → Server → Bridge:  { action: "send_message", sessionId: "abc", text: ".
 Bridge: _pool.send(sessionId) → headless `claude -p --resume <id>` over kept-open stdin (spawns if none)
         → stream_delta/stream_end (preview) + authoritative `messages` rows
 
-New session (TODO): projectHash-only send → headless spawn without --resume, sessionId from system/init.
+New regular session: projectHash-only send → Bridge mints a UUID and acknowledges it before
+spawning headless with `--session-id <id>`, so the app subscribes before stream frames arrive.
 
-(send_message also accepts asAgent:true → the new session runs as a Claude Agents background session)
+New agent session: `send_message` with `asAgent:true` launches detached `claude --bg`; the agent
+poll and watcher publish its metadata and messages.
 ```
 
 #### How text reaches Claude (headless stdin)
@@ -238,9 +306,9 @@ The bridge writes one JSON line per message to the session's headless process st
 ### Create project
 
 ```
-App → Server → Bridge:  { action: "create_project", projectPath: "workspace/x", device: "MacBook-Pro", asAgent?: bool }
-Bridge: mkdir -p → derive projectHash → launch session → return result
-Bridge → Server → App:  { action: "create_project_result", ok: true, sessionId: "new-uuid", projectPath: "workspace/x" }
+App → Server → Bridge:  { action: "create_project", projectPath: "workspace/x", device: "MacBook-Pro" }
+Bridge: mkdir -p → derive projectHash → seed project metadata → return result
+Bridge → Server → App:  { action: "create_project_result", ok: true, projectHash: "...", projectName: "x", projectPath: "workspace/x" }
 ```
 
 ### View a project file (click-to-sync)
@@ -256,81 +324,98 @@ Bridge: resolve path (relative → projectHashToPath), stat, dedup by key (LRU 1
 Bridge → Server → App:  { action: "file_ready", requestId: "...", sessionId: "abc",
                           key: "<sha>.ext", path: "/abs/path", size: N, truncated: false, image: false }
 App: text  → GET /api/bridge/file/{key}  → detectLang(path) → highlight.js file viewer
-     image → GET /api/bridge/image/{key} → reuse the image overlay (viewImage)
+     image → GET /api/bridge/image-url/{key} → signed S3 URL → reuse the image overlay (viewImage)
      video → GET /api/bridge/video-url/{key} (presigned, no-store, ~50min app cache) → <video> streams from S3
-     (text/image content travels via REST/S3, never over WS — avoids the 128KB frame limit;
+     (text/image content travels via REST/S3, never over WS — avoids the ~31KB frame budget;
       video bytes stream browser↔S3 directly, bypassing the Lambda 6MB payload limit)
 ```
 
 ### Slash commands (autocomplete)
 
-Mirrors Claude Code's `/`-menu: typing `/` at the start of the input lists all
-available slash commands (names only, like CC); continuing to type (`/as`) filters
-by prefix; ↑↓ navigates, Enter/Tab/click selects and **sends immediately**
-(`/name\n` via the normal send path).
+Mirrors Claude Code's `/`-menu: typing `/` lists the current runtime-filtered
+commands with the same descriptions and argument hints. Continuing to type
+filters by prefix; ↑↓ navigates; commands with options open a second-level picker.
 
 ```
-App → Server → Bridge:  { action: "list_commands", projectHash: "xxx", device: "MacBook-Pro", requestId: "cmds_..." }
-Bridge: scanSlashCommands(projectHashToPath(projectHash)) — live read, no cache/watch (~15ms):
-  user    → ~/.claude/commands/**/*.md  +  ~/.claude/skills/*/SKILL.md
-  project → <projectDir>/.claude/commands/**/*.md  +  /skills/*/SKILL.md
-  plugin  → settings.json enabledPlugins → resolve each plugin root → /commands + /skills
-            (root resolution: installed_plugins.json installPath → extraKnownMarketplaces
-             path → plugins/marketplaces/<mkt>/plugins/<name> → .../<name>)
-  builtin → BUILTIN_COMMANDS static list (bundled skills + builtin slash commands
-            compiled into CC, no file on disk). Mirrors EXACTLY the running CC's
-            "/" menu beyond disk-scannable commands (no padding, no hidden cmds) —
-            re-sync on CC upgrades. e.g. batch clear compact context debug
-            deep-research goal init loop run review verify usage update-config…
-  name = command file basename (sans .md, no file read); subdirs → ':' namespace.
-         skill name from SKILL.md frontmatter `name` (fallback dir name).
-  dedup by name (user>project>plugin>builtin — user recap.md beats bundled recap),
-  then sort all names alphabetically (localeCompare — char-by-char). Names only.
-Bridge → Server → App:  { action: "commands_list", requestId: "cmds_...", commands: [{name, source}] }
-  (~2.5KB for ~75 commands; server broadcasts to ALL app connections for the account —
-   like create_project_result — so it reaches the new-session view too, which has no
-   sessionId subscription)
-App: split reply by source → cache global (user/plugin/builtin) once per DEVICE
-     (apeek_cmds:g:<device>) + project cmds per PROJECT (apeek_cmds:p:<projectHash>).
-     Typing "/" shows the UNION (deduped, sorted). Prefetched on session open
-     (startWs / WS onopen) → cache shows instantly, WS refresh updates it. A brand-new
-     project dir gets all global commands from the device cache with no per-project wait.
+App → Server → Bridge:  { action: "list_commands", projectHash: "xxx", device: "MacBook-Pro", knownRevision: "...", requestId: "cmds_..." }
+Bridge → Claude `-p` control_request `{subtype:"initialize"}` with
+         `--no-session-persistence`
+Claude → Bridge: runtime-filtered `commands`, `models`, aliases, descriptions,
+                 argument hints, account/provider and feature state
+Bridge: filter terminal-only or unsafe local commands; order executable local
+        commands alphabetically, followed by prompt/Skill commands alphabetically,
+        matching the TUI groups; attach live model/effort/fast picker options
+App: cache by device/runtime/project for five minutes; send `list_commands` only
+     when missing or expired
+Bridge: force-refresh that current project for every real request; hash the compact
+        frontend DTO into a stable revision; hard-truncate descriptions to 256
+        UTF-8 bytes without splitting characters; coalesce concurrent refreshes
+Bridge → REST: upload changed catalog to an account-scoped stable S3 object
+Bridge → Server → App: small `command_catalog_ready`, or `notModified`
+App → REST: fetch the catalog by `catalogRef`
+App: cache content + revision by device/runtime/project; show it immediately, skip
+     validation for five minutes, and redraw an open top-level menu only when revision changes
 ```
+
+Session-scoped picker values are requested separately through `list_command_options`; they never
+enter the project catalog. This prevents Codex agent/subagent choices from one thread appearing in
+another thread.
+
+If an old Claude Code version does not support `initialize`, `commands.mjs` scans
+only user/project/plugin Markdown commands and Skills. The fallback parses
+frontmatter descriptions, argument hints and `user-invocable`; it intentionally
+does not maintain a static built-in table.
 
 ### Local slash commands
 
-The tmux `capture-pane` capture for terminal-only commands (`command_output`) was
-removed with tmux (Phase 2E). Under headless a `/cmd` is sent as plain text and its
-output streams back normally; pure-TUI commands (`/usage`, `/context`, …) just
-aren't exposed. `/compact` still surfaces via its `<local-command-stdout>` jsonl row
-(rendered by `renderLocalCommandStdout`). `LOCAL_COMMANDS`/`DIALOG_COMMANDS`/
-`SYNTHETIC_COMMANDS` in `commands.mjs` now only tag the command list.
+The tmux `command_output` path was removed. Prompt/Skill commands and streaming local commands are
+sent through the current headless process. Synchronous commands such as model selection use the same
+process but finish through an ephemeral `commandOutput`; they do not invent a JSONL row.
+
+`/usage` and its aliases (`/cost`, `/stats`) open a structured four-tab Settings panel. `/status`
+and bare `/config` open the same panel at their matching tab. Status, Config, and current-session
+Usage use `initialize`, `get_settings`, and `get_usage`. Stats is a read-only Worker-thread scan of
+Claude's JSONL history, with Overview/Models and all-time/7-day/30-day ranges. The panel never writes
+Claude settings or transcripts. `/config key=value` remains Claude's native setting command.
+
+See [claude-commands.md](claude-commands.md) for the audited TUI command matrix and explicit
+full/reduced/filtered classifications.
 
 ## Entering a Session — Complete Flow
 
 ```
 App taps session "abc":
 
-1. _wsBuffer = [] → start buffering WS messages
+1. Open a request-scoped FetchBarrier
    WS: { action: "subscribe", sessionId: "abc" }
 
 2. bufferAndFetch(sessionId, '') → REST load from DDB
-   GET /api/bridge/messages?session=abc
+   GET /api/bridge/messages?session=abc&device=D&project=P
    → DDB has cached messages → return instantly (<100ms)
    → DDB empty → return empty (bridge hasn't synced this session yet)
+   → Session status is read in parallel and returned with the message page
 
-3. Merge: DDB results + _wsBuffer, dedup by uuid, sort by timestamp
+3. Merge:
+   → mergeFetchWindow(REST, complete no-seq historyBuffer)
+   → mergeLocalHistory(current confirmed history, fetched + delayed strict authority)
+   → preserve REST/WS source order; do not globally sort by timestamp
 
-4. _wsBuffer = null → switch to real-time mode. Render merged result.
+4. Resolve running state:
+   → applied WS lifecycle during REST wins
+   → otherwise use response status
+   → message-tail inference only if status is missing
+
+5. Keyed DOM reconcile → close FetchBarrier → replay strict DOM operations.
    Track wsLastTimestamp for reconnect recovery.
 
-5. Subsequent WS messages → append directly via updateLastTurn().
+6. Subsequent complete no-seq WS messages → append to confirmed tail before pending bubbles.
 
-6. WS reconnect → subscribe + recoverMissing():
-   _wsBuffer = [] → bufferAndFetch(sessionId, wsLastTimestamp)
-   Same buffer+fetch+merge pattern, dedup + sort + full re-render.
+7. WS reconnect → subscribe + recoverMissing():
+   bufferAndFetch(sessionId, wsLastTimestamp)
+   Same FetchBarrier + merge + keyed DOM reconciliation.
+   The returned status replaces the former active-turn state request.
 
-7. App leaves session:
+8. App leaves session:
    WS: { action: "unsubscribe", sessionId: "abc" }
 ```
 
@@ -346,12 +431,18 @@ App taps session "abc":
 ## Code Structure
 
 ```
-agentpeek/
+baton/
 ├── bridge/
 │   ├── bridge.mjs          # Entry point — startup, orchestration
 │   ├── config.mjs          # CLI args, config loading, server config fetch
 │   ├── http.mjs            # HTTP POST helper
 │   ├── extract.mjs         # Message extraction, image compression, DDB upload
+│   ├── runtime-adapter.mjs # Shared runtime read contract
+│   ├── runtime-registry.mjs # Claude/Codex adapter registry
+│   ├── claude-runtime.mjs  # Claude runtime adapter
+│   ├── codex-runtime.mjs   # Codex read/status runtime adapter
+│   ├── codex-session.mjs   # Codex rollout discovery
+│   ├── codex-extract.mjs   # Codex event normalization
 │   ├── session.mjs         # Preview, model, project name, session status detection
 │   ├── headless.mjs        # ClaudePool — persistent `claude -p` stream-json process per session
 │   ├── commands.mjs        # Slash-command scan (user/project/plugin/builtin)
@@ -364,7 +455,7 @@ agentpeek/
 │   │   ├── bridge_sync.py  # POST sync-sessions, sync-messages, upload-image, upload-file, video-prepare
 │   │   ├── bridge_read.py  # GET devices/projects/sessions/messages/image/file/video-url
 │   │   └── bridge_ws.py    # WS relay ($connect/$disconnect/$default)
-│   ├── template/AgentPeek.template
+│   ├── template/Baton.template
 │   └── install.sh          # One-command deploy (ECR → S3 → CodeBuild → CloudFormation)
 ├── web/
 │   ├── landing.html        # API key auth page
@@ -404,6 +495,7 @@ agentpeek/
 ├── docs/
 │   ├── api.md              # Full API specification
 │   ├── claude-code-bridge.md  # This file
+│   ├── codex.md            # Codex design, implementation status, and validation
 │   ├── frontend-patterns.md   # Frontend rendering patterns
 │   └── assets/             # Images (promo.avif, etc.)
 ├── package.json            # Root package (Vite + Tauri CLI)
@@ -417,7 +509,7 @@ agentpeek/
 - New/resumed sessions detected instantly via fs.watch
 - fs.watch → immediate read → WS push (no debounce, no polling)
 - Periodic check (1min) only detects disappeared CC processes
-- Deployed to ap-northeast-1 (AgentPeekTest), verified
+- Deployed to ap-northeast-1 (Baton), verified
 
 ### Phase 2A: Backend + API Validation ✅ Complete
 
@@ -433,7 +525,8 @@ agentpeek/
 - Server WS relay: send_message, permission_reply, interrupt
 - Bridge: `_pool.send` → headless `claude -p --resume` (was tmux findTarget/sendKeys/auto-launch)
 - Viewer: message sending + optimistic rendering + dedup, permission prompt + user interaction, image sending via S3
-- WS reconnect recovery: track wsLastTimestamp → recoverMissing() on reconnect
+- WS reconnect recovery: track wsLastTimestamp → recoverMissing() returns incremental messages plus
+  Session status; no separate active-turn lookup or online inactivity probe
 - Device routing
 - Permission: bridge relays CC's `control_request` → app prompt → `permission_reply` (was client-side scan + capture-pane)
 
@@ -444,7 +537,7 @@ Tauri v2 wraps the web/ static frontend as a native app — zero web code change
 - `src-tauri/` at project root (sibling to web/, bridge/, server/)
 - `frontendDist: "../web"` — directly serves static HTML/CSS/JS
 - `withGlobalTauri: true` — JS accesses native APIs via `window.__TAURI__`
-- Bundle identifier: `com.agentpeek.app`
+- Bundle identifier: `com.batonai.app`
 
 **Targets:**
 - Android: APK via `npm run build:android`
@@ -456,8 +549,24 @@ Tauri v2 wraps the web/ static frontend as a native app — zero web code change
 - Local notifications: `tauri-plugin-notification` (planned)
 - Biometric auth: `tauri-plugin-biometric` (planned)
 
+### Phase 2D: Claude Agents ✅ Complete
+
+- Daemon roster and agent catalog provide agent identity and active worker state.
+- Existing agents are resumed through the same headless pool as regular sessions.
+- New background agents launch through detached `claude --bg`.
+- Agent status supports Working, Needs input, and Completed without reviving stale daemon state.
+
+### Phase 2E: Headless Streaming ✅ Complete
+
+- `ClaudePool` is the only send path; tmux and Stall Rescue are removed.
+- Existing and new sessions stream previews and authoritative rows through the shared WS protocol.
+- Permission requests, `AskUserQuestion`, `ExitPlanMode`, interrupt, queueing, idle reap, and LRU
+  process limits are implemented.
+- Busy pool ownership, daemon roster state, and external JSONL/process state use explicit precedence
+  so Web takeover and terminal resume update status correctly.
+
 ### Phase 3: Production Polish (Future)
-- Windows support: bridge process detection, Task Scheduler auto-start, %APPDATA% paths
+- Improve native Windows process/status precision
 - Push notifications
-- Persist bridge sync state (~/.claude-bridge/sync-state.json) to avoid re-uploading messages on restart
-- DDB TTL: auto-clean messages for sessions inactive > 30 days
+- Harden the existing persisted `~/.baton-bridge/synced.json` recovery path
+- Continue monitoring the existing 90-day message-cache TTL

@@ -11,6 +11,16 @@ export const state = {
   // ---- Navigation / device list (app.js) ----
   appState: { device: null, project: null, session: null, sessionPreview: '' },
   deviceOnlineMap: {},
+  deviceDisplayNameMap: {},
+  newSessionRuntimes: [],
+  rootSessionId: null,
+  rootSessionPreview: '',
+  activeThreadId: null,
+  activeThreadCanSend: true,
+  sessionThreads: [],
+  threadRequestVersion: 0,
+  projectFilesOpen: false,
+  gitStatusOpen: false,
 
   // ---- Batch-delete selection (app.js) ----
   selectMode: false,
@@ -20,31 +30,29 @@ export const state = {
   // ---- WebSocket connection + message state (ws.js) ----
   ws: null,
   wsSessionId: null,
+  wsRootSessionId: null,
   wsMessageCount: 0,
   wsStatusText: '',
+  wsRealtimeStatusText: '',
   wsAllMessages: [],          // all messages for the active session, sorted ascending
-  wsLastTimestamp: '',        // for reconnect recovery
+  wsMessageUuids: new Set(),  // UUID index for final persisted messages; streaming bypasses it
   wsProjectHash: null,        // for new session creation
   wsRequestId: null,          // unique ID per new-session creation flow
-  wsRunning: false,           // active session still running (derived via deriveRunning)
-  wsOpenStatus: null,         // bridge's pane-checked status at session open; authoritative for ambiguous trailing-user case, cleared once live frames arrive
+  wsRunning: false,           // active session still running
+  stickBottom: true,          // auto-scroll intent: real user drag clears it; returning until the bottom button hides / tapping it restores
   _titleTier: 0,              // 4=customTitle 3=ai-title 2=lastPrompt 1=firstUser; never downgrade
+  _titleRename: null,
   wsRenderedCount: 0,
   wsHasMore: false,           // more older messages on server
   wsOldestTimestamp: '',      // cursor for older-load
   wsLoadingOlder: false,
-  _wsBuffer: null,            // null = normal mode, [] = buffering during initial load
   _syncedOnce: null,          // sessionId already re-fetched once after sync_complete (anti-loop)
   _pendingCreatePath: null,   // projectPath for create_project matching
   pendingSentMessages: [],
-  lastDeliveredSeq: -1,       // highest send-seq confirmed delivered; earlier still-pending = CC-skipped orphan
 
   // ---- Image staging (image.js) ----
   stagedImages: [],
 
-  // ---- File viewer (fileviewer.js) ----
-  fileCache: new Map(),       // key → { text, path, truncated }
+  // ---- File viewer (project/file-viewer.js) ----
   videoUrlCache: new Map(),   // key → { url, exp } — presigned GET URL + expiry (ms epoch)
-  _pendingFileReq: null,      // { requestId, timer }
-  _fileReqSeq: 0,
 };

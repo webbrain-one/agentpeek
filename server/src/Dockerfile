@@ -4,6 +4,7 @@ WORKDIR /build
 COPY package.json package-lock.json vite.config.js ./
 RUN npm ci --no-audit --no-fund
 COPY web/ web/
+COPY bridge/ bridge/
 RUN npm run build
 
 # Stage 2: Python Lambda runtime
@@ -12,12 +13,16 @@ COPY --from=public.ecr.aws/awsguru/aws-lambda-adapter:0.9.1 /lambda-adapter /opt
 
 WORKDIR /app
 COPY requirements.txt .
-COPY main.py .
+COPY main.py api_key.py ./
 COPY bridge_sync.py .
 COPY bridge_read.py .
 COPY bridge_ws.py .
+COPY message_history.py .
+COPY terminal_ws.py terminal_direct_ws.py realtime_direct_ws.py preview_tunnel_ws.py ./
+COPY project/ project/
 COPY --from=web-builder /build/dist web/
 RUN pip install --no-cache-dir -r requirements.txt
+RUN chmod -R a+rX /app
 
 ARG APP_VERSION=dev
 ENV APP_VERSION=$APP_VERSION
