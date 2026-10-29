@@ -83,8 +83,24 @@ var WS_PROBE_TIMEOUT_MS = window.__APEEK_TEST__ ? 50 : 5000;
 // A send on a socket silent this long probes it, so a dead socket is rebuilt within the send window.
 var WS_SEND_STALE_MS = 15000;
 var WS_SEND_PROBE_TIMEOUT_MS = window.__APEEK_TEST__ ? 50 : 3000;
+// Periodic ping on both channels: keeps API Gateway's 10-minute idle timer away and finds dead sockets.
+var WS_PING_INTERVAL_MS = 25000;
+var WS_PING_TIMEOUT_MS = 15000;
+// A seq gap that outlives a ping round-trip on every channel and this floor is treated as a lost frame;
+// the floor covers server-side reordering, a misjudgment costs one REST refresh.
+var TURN_GAP_MIN_MS = window.__APEEK_TEST__ ? 30 : 3000;
+var TURN_GAP_GIVE_UP_MS = window.__APEEK_TEST__ ? 300 : 20000;
+// A running turn silent this long is checked against REST in case its tail frames were lost.
+var SILENT_TURN_MS = window.__APEEK_TEST__ ? 100 : 60000;
 var _wsProbeTimer = null;
+var _wsPingTimer = null;
 var _wsLastInboundAt = 0;
+var _controlPongAt = 0;
+// Stacks with the realtime_ping route answer it in API Gateway; older ones only answer heartbeat via Lambda.
+var _controlPingRoute = false;
+var _turnGapWatch = null;
+var _lastTurnEventAt = 0;
+var _silentTurnCheckAt = 0;
 var _bottomFollowFrame = null;
 var _pendingBottomFollow = null;
 
@@ -385,6 +401,7 @@ function connectWs(_, projectHash) {
   _realtimeReceiver?.dispose();
   _realtimeReceiver = null;
   state.wsRealtimeStatusText = '';
+  _controlPingRoute = false;
   state.ws = new WebSocket(state.WS_URL + '?apiKey=' + state.KEY + '&role=app&realtime=1');
 
   state.ws.onopen = function () {
@@ -405,6 +422,11 @@ function connectWs(_, projectHash) {
     if (window.prefetchCommands) window.prefetchCommands();
     window.refreshGitStatusOnReconnect?.();
     _realtimeReceiver.start();
+    wsSend({ action: 'realtime_ping' });
+    if (!_wsPingTimer) {
+      _wsPingTimer = setInterval(pingWsChannels, WS_PING_INTERVAL_MS);
+      _wsPingTimer?.unref?.();
+    }
   };
 
   state.ws.onmessage = function (e) {
@@ -473,17 +495,86 @@ function probeWsLiveness(timeoutMs) {
     state.ws = null;
     connectWs();
   }, timeoutMs || WS_PROBE_TIMEOUT_MS);
-  wsSend({ action: 'heartbeat' });
+  sendControlPing();
+}
+
+function sendControlPing() {
+  wsSend({ action: _controlPingRoute ? 'realtime_ping' : 'heartbeat' });
 }
 
 // A missing Server receipt means the socket may be dead; probe once, never restart a running probe.
-function probeSocketForSend() {
+function probeSocketForSend(timeoutMs) {
   if (_wsProbeTimer || state.ws?.readyState !== WebSocket.OPEN) return;
-  probeWsLiveness(WS_SEND_PROBE_TIMEOUT_MS);
+  probeWsLiveness(timeoutMs || WS_SEND_PROBE_TIMEOUT_MS);
 }
 
 function probeSocketIfStale() {
   if (_wsLastInboundAt && Date.now() - _wsLastInboundAt > WS_SEND_STALE_MS) probeSocketForSend();
+}
+
+function pingWsChannels() {
+  if (document.hidden || !state.wsSessionId || state.ws?.readyState !== WebSocket.OPEN) return;
+  probeSocketForSend(WS_PING_TIMEOUT_MS);
+  _realtimeReceiver?.ping(WS_PING_TIMEOUT_MS);
+  checkSilentTurn();
+}
+
+function clearTurnGapWatch() {
+  clearTimeout(_turnGapWatch?.timer);
+  _turnGapWatch = null;
+}
+
+function watchTurnGap(turnId) {
+  var missing = _turnEventQueue.missingSeq(turnId);
+  if (_turnGapWatch?.turnId === turnId && _turnGapWatch.seq !== missing) clearTurnGapWatch();
+  if (missing == null || _turnGapWatch) return;
+  _turnGapWatch = { turnId: turnId, seq: missing, since: Date.now(), timer: null };
+  // A pong proves its socket is alive and has delivered what was already posted to it, over the
+  // same client link; it does not bound when the server posts the missing frame.
+  sendControlPing();
+  _realtimeReceiver?.ping(WS_PING_TIMEOUT_MS);
+  _turnGapWatch.timer = setTimeout(checkTurnGap, TURN_GAP_MIN_MS);
+}
+
+function checkTurnGap() {
+  var watch = _turnGapWatch;
+  if (!watch) return;
+  if (_turnEventQueue.missingSeq(watch.turnId) !== watch.seq) return clearTurnGapWatch();
+  var fenced = _controlPongAt > watch.since
+    && (!_realtimeReceiver?.lastPongAt || _realtimeReceiver.lastPongAt > watch.since);
+  if (fenced) {
+    clearTurnGapWatch();
+    refreshSessionMessages();
+  } else if (Date.now() - watch.since < TURN_GAP_GIVE_UP_MS) {
+    // No pong yet: either still in flight (slow network) or a dead socket the ping timeout rebuilds.
+    watch.timer = setTimeout(checkTurnGap, Math.min(1000, TURN_GAP_MIN_MS));
+  } else {
+    clearTurnGapWatch();
+  }
+}
+
+// A lost tail (including stream_end) leaves no gap to see; REST status settles the turn instead.
+function checkSilentTurn() {
+  var turnIds = _streamCoordinator.activeTurnIds();
+  var now = Date.now();
+  if (!turnIds.length || _turnGapWatch || document.getElementById('permission-prompt')
+    || now - Math.max(_lastTurnEventAt, _silentTurnCheckAt) < SILENT_TURN_MS) return false;
+  _silentTurnCheckAt = now;
+  var sessionId = state.wsSessionId;
+  return refreshSessionMessages({ preserveLive: true }).then(function (result) {
+    if (result?.status !== 'completed' || state.wsSessionId !== sessionId
+      || Date.now() - _lastTurnEventAt < SILENT_TURN_MS) return;
+    // A completed Session has no running execution, so its lost stream_end ends that too.
+    _activeExecutionIds.clear();
+    for (var turnId of turnIds) {
+      _streamCoordinator.settleTurn(turnId);
+      _turnEventQueue.closeTurn(turnId);
+      settlePendingAtTurnEnd(turnId, {});
+    }
+    drainStrictStreamOperations();
+    applyResolvedLiveActivity(hasOutstandingTurns() ? 'running' : 'completed');
+    updateSendBtn();
+  });
 }
 
 // Sends are idempotent by turnId; a rebuilt socket carries every send the Server has not receipted.
@@ -605,6 +696,7 @@ function routeTurnEvent(message) {
   if (message.goalContinuation === true && message.sessionId === state.wsSessionId) {
     _goalContinuationIds.add(message.turnId);
   }
+  if (isStrictTurnEvent(message)) _lastTurnEventAt = Date.now();
   var barrier = _historyFetchBarriers.current(message.sessionId);
   if (barrier && message.sessionId === barrier.sessionId
     && (isStrictTurnEvent(message) || message.action === 'messages')) {
@@ -651,6 +743,7 @@ function routeTurnEvent(message) {
   } else if (_turnEventQueue.isResumeCandidate(message.turnId)) {
     resumeLateJoinAtCheckpoint(message.turnId);
   }
+  watchTurnGap(message.turnId);
   if (isControlEvent(message)
     && !_handledControlEvents.has(strictEventKey(message))) {
     scheduleControlEventFallback(message);
@@ -811,6 +904,9 @@ function dispatchWsMessage(msg) {
     } else if (msg.action === 'permission_request'
       || msg.action === 'permission_resolved') {
       dispatchControlEvent(msg);
+    } else if (msg.action === 'heartbeat' || msg.action === 'realtime_pong') {
+      if (msg.action === 'realtime_pong') _controlPingRoute = true;
+      _controlPongAt = Date.now();
     } else if (msg.action === 'send_message_received') {
       var receivedPending = msg.turnId ? findPending(msg.turnId) : null;
       acceptPendingReceipt(receivedPending);
@@ -1540,14 +1636,20 @@ function resetStreamSessionState(keepHistoryRequest = false) {
   _queuedTurnIds.clear();
   _activeExecutionIds.clear();
   _goalContinuationIds.clear();
-  _executionEvents.reset();
-  for (var timer of _executionRecoveryTimers.values()) clearTimeout(timer);
-  _executionRecoveryTimers.clear();
+  // A snapshot refresh keeps execution order: frames after it continue the same executionSeq.
+  if (!keepHistoryRequest) {
+    _executionEvents.reset();
+    for (var timer of _executionRecoveryTimers.values()) clearTimeout(timer);
+    _executionRecoveryTimers.clear();
+    _lastTurnEventAt = 0;
+    _silentTurnCheckAt = 0;
+  }
   _turnSendOrder.clear();
   for (var timer of _controlEventTimers.values()) clearTimeout(timer);
   _controlEventTimers.clear();
   for (var endTimer of _gappedEndTimers.values()) clearTimeout(endTimer);
   _gappedEndTimers.clear();
+  clearTurnGapWatch();
   _suppressTurnEndRecovery = false;
   _handledControlEvents.clear();
   _controlRequestState.clear();
@@ -1652,6 +1754,8 @@ function disconnectWs() {
   state.wsRealtimeStatusText = '';
   _wsConnectionGeneration++;
   clearWsProbe();
+  clearInterval(_wsPingTimer);
+  _wsPingTimer = null;
   if (window.resetCommandRequest) window.resetCommandRequest();
   if (_wsReconnectTimer) {
     clearTimeout(_wsReconnectTimer);
@@ -2988,6 +3092,7 @@ Object.assign(window, {
 if (typeof window !== 'undefined' && window.__APEEK_TEST__) {
   window.__wsTest = {
     handleWsMessage: handleWsMessage,
+    checkSilentTurn: checkSilentTurn,
     flushLateJoinCompletion: completeLateJoinTurn,
     resumeLateJoinAtCheckpoint: resumeLateJoinAtCheckpoint,
     commitMessages: commitMessages,
